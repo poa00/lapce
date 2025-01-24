@@ -1,18 +1,19 @@
 use std::{rc::Rc, sync::Arc};
 
 use floem::{
-    event::{Event, EventListener},
+    event::{Event, EventListener, EventPropagation},
     kurbo::{Point, Size},
-    reactive::{create_rw_signal, ReadSignal, RwSignal},
+    reactive::{
+        create_rw_signal, ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith,
+    },
     style::{CursorStyle, Style},
     taffy::AlignItems,
     unit::PxPctAuto,
-    view::{AnyView, View},
     views::{
         container, dyn_stack, empty, h_stack, label, stack, stack_from_iter, tab,
         text, Decorators,
     },
-    EventPropagation,
+    AnyView, IntoView, View,
 };
 
 use super::{
@@ -29,19 +30,15 @@ use crate::{
     app::{clickable_icon, clickable_icon_base},
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     file_explorer::view::file_explorer_panel,
+    panel::{
+        call_hierarchy_view::show_hierarchy_panel, document_symbol::symbol_panel,
+        implementation_view::implementation_panel,
+        references_view::references_panel,
+    },
     window_tab::{DragContent, WindowTabData},
 };
 
 pub fn foldable_panel_section(
-    header: impl View + 'static,
-    child: impl View + 'static,
-    config: ReadSignal<Arc<LapceConfig>>,
-) -> impl View {
-    let open = create_rw_signal(true);
-    foldable_panel_section_s(header, child, open, config)
-}
-
-fn foldable_panel_section_s(
     header: impl View + 'static,
     child: impl View + 'static,
     open: RwSignal<bool>,
@@ -57,9 +54,7 @@ fn foldable_panel_section_s(
                         LapceIcons::PANEL_FOLD_UP
                     }
                 },
-                Some(move || {
-                    open.update(|open| *open = !*open);
-                }),
+                None::<Box<dyn Fn()>>,
                 || false,
                 || false,
                 config,
@@ -70,7 +65,11 @@ fn foldable_panel_section_s(
             s.padding_horiz(10.0)
                 .padding_vert(6.0)
                 .width_pct(100.0)
+                .cursor(CursorStyle::Pointer)
                 .background(config.get().color(LapceColor::EDITOR_BACKGROUND))
+        })
+        .on_click_stop(move |_| {
+            open.update(|open| *open = !*open);
         }),
         child.style(move |s| s.apply_if(!open.get(), |s| s.hide())),
     ))
@@ -99,36 +98,46 @@ impl PanelBuilder {
         name: &'static str,
         height: Option<PxPctAuto>,
         view: impl View + 'static,
+        open: RwSignal<bool>,
         style: impl Fn(Style) -> Style + 'static,
     ) -> Self {
         let position = self.position;
-        let open = create_rw_signal(true);
-        let view = foldable_panel_section_s(text(name), view, open, self.config)
-            .style(move |s| {
-                let s = s.width_full().flex_col();
-                // Use the manual height if given, otherwise if we're open behave flex,
-                // otherwise, do nothing so that there's no height
-                let s = if open.get() {
-                    if let Some(height) = height {
-                        s.height(height)
-                    } else {
-                        s.flex_grow(1.0).flex_basis(0.0)
-                    }
-                } else if position.is_bottom() {
-                    s.flex_grow(0.3).flex_basis(0.0)
+        let view = foldable_panel_section(
+            text(name).style(move |s| s.selectable(false)),
+            view,
+            open,
+            self.config,
+        )
+        .style(move |s| {
+            let s = s.width_full().flex_col();
+            // Use the manual height if given, otherwise if we're open behave flex,
+            // otherwise, do nothing so that there's no height
+            let s = if open.get() {
+                if let Some(height) = height {
+                    s.height(height)
                 } else {
-                    s
-                };
+                    s.flex_grow(1.0).flex_basis(0.0)
+                }
+            } else if position.is_bottom() {
+                s.flex_grow(0.3).flex_basis(0.0)
+            } else {
+                s
+            };
 
-                style(s)
-            });
-        self.views.push(view.any());
+            style(s)
+        });
+        self.views.push(view.into_any());
         self
     }
 
     /// Add a view to the panel
-    pub fn add(self, name: &'static str, view: impl View + 'static) -> Self {
-        self.add_general(name, None, view, std::convert::identity)
+    pub fn add(
+        self,
+        name: &'static str,
+        view: impl View + 'static,
+        open: RwSignal<bool>,
+    ) -> Self {
+        self.add_general(name, None, view, open, std::convert::identity)
     }
 
     /// Add a view to the panel with a custom style applied to the overall header+section-content
@@ -136,9 +145,10 @@ impl PanelBuilder {
         self,
         name: &'static str,
         view: impl View + 'static,
+        open: RwSignal<bool>,
         style: impl Fn(Style) -> Style + 'static,
     ) -> Self {
-        self.add_general(name, None, view, style)
+        self.add_general(name, None, view, open, style)
     }
 
     /// Add a view to the panel with a custom height that is only used when the panel is open
@@ -147,8 +157,15 @@ impl PanelBuilder {
         name: &'static str,
         height: impl Into<PxPctAuto>,
         view: impl View + 'static,
+        open: RwSignal<bool>,
     ) -> Self {
-        self.add_general(name, Some(height.into()), view, std::convert::identity)
+        self.add_general(
+            name,
+            Some(height.into()),
+            view,
+            open,
+            std::convert::identity,
+        )
     }
 
     /// Add a view to the panel with a custom height that is only used when the panel is open
@@ -158,9 +175,10 @@ impl PanelBuilder {
         name: &'static str,
         height: impl Into<PxPctAuto>,
         view: impl View + 'static,
+        open: RwSignal<bool>,
         style: impl Fn(Style) -> Style + 'static,
     ) -> Self {
-        self.add_general(name, Some(height.into()), view, style)
+        self.add_general(name, Some(height.into()), view, open, style)
     }
 
     /// Add a view to the panel with a custom height that is only used when the panel is open
@@ -169,11 +187,13 @@ impl PanelBuilder {
         name: &'static str,
         height: f64,
         view: impl View + 'static,
+        open: RwSignal<bool>,
     ) -> Self {
         self.add_general(
             name,
             Some(PxPctAuto::Pct(height)),
             view,
+            open,
             std::convert::identity,
         )
     }
@@ -425,6 +445,7 @@ pub fn panel_container_view(
             .border_color(config.color(LapceColor::LAPCE_BORDER))
             .color(config.color(LapceColor::PANEL_FOREGROUND))
     })
+    .debug_name(format!("{:?} Pannel Container View", position))
 }
 
 fn panel_view(
@@ -449,26 +470,40 @@ fn panel_view(
         move |kind| {
             let view = match kind {
                 PanelKind::Terminal => {
-                    container(terminal_panel(window_tab_data.clone()))
+                    terminal_panel(window_tab_data.clone()).into_any()
                 }
                 PanelKind::FileExplorer => {
-                    container(file_explorer_panel(window_tab_data.clone(), position))
+                    file_explorer_panel(window_tab_data.clone(), position).into_any()
                 }
-                PanelKind::SourceControl => container(source_control_panel(
-                    window_tab_data.clone(),
-                    position,
-                )),
+                PanelKind::SourceControl => {
+                    source_control_panel(window_tab_data.clone(), position)
+                        .into_any()
+                }
                 PanelKind::Plugin => {
-                    container(plugin_panel(window_tab_data.clone(), position))
+                    plugin_panel(window_tab_data.clone(), position).into_any()
                 }
                 PanelKind::Search => {
-                    container(global_search_panel(window_tab_data.clone(), position))
+                    global_search_panel(window_tab_data.clone(), position).into_any()
                 }
                 PanelKind::Problem => {
-                    container(problem_panel(window_tab_data.clone(), position))
+                    problem_panel(window_tab_data.clone(), position).into_any()
                 }
                 PanelKind::Debug => {
-                    container(debug_panel(window_tab_data.clone(), position))
+                    debug_panel(window_tab_data.clone(), position).into_any()
+                }
+                PanelKind::CallHierarchy => {
+                    show_hierarchy_panel(window_tab_data.clone(), position)
+                        .into_any()
+                }
+                PanelKind::DocumentSymbol => {
+                    symbol_panel(window_tab_data.clone(), position).into_any()
+                }
+                PanelKind::References => {
+                    references_panel(window_tab_data.clone(), position).into_any()
+                }
+                PanelKind::Implementation => {
+                    implementation_panel(window_tab_data.clone(), position)
+                        .into_any()
                 }
             };
             view.style(|s| s.size_pct(100.0, 100.0))
@@ -514,17 +549,20 @@ fn panel_picker(
         |p| *p,
         move |p| {
             let window_tab_data = window_tab_data.clone();
-            let (icon, tooltip) = match p {
-                PanelKind::Terminal => (LapceIcons::TERMINAL, "Terminal"),
-                PanelKind::FileExplorer => {
-                    (LapceIcons::FILE_EXPLORER, "File Explorer")
-                }
-                PanelKind::SourceControl => (LapceIcons::SCM, "Source Control"),
-                PanelKind::Plugin => (LapceIcons::EXTENSIONS, "Plugins"),
-                PanelKind::Search => (LapceIcons::SEARCH, "Search"),
-                PanelKind::Problem => (LapceIcons::PROBLEM, "Problems"),
-                PanelKind::Debug => (LapceIcons::DEBUG_ALT, "Debug"),
+            let tooltip = match p {
+                PanelKind::Terminal => "Terminal",
+                PanelKind::FileExplorer => "File Explorer",
+                PanelKind::SourceControl => "Source Control",
+                PanelKind::Plugin => "Plugins",
+                PanelKind::Search => "Search",
+                PanelKind::Problem => "Problems",
+                PanelKind::Debug => "Debug",
+                PanelKind::CallHierarchy => "Call Hierarchy",
+                PanelKind::DocumentSymbol => "Document Symbol",
+                PanelKind::References => "References",
+                PanelKind::Implementation => "Implementation",
             };
+            let icon = p.svg_name();
             let is_active = {
                 let window_tab_data = window_tab_data.clone();
                 move || {
@@ -570,7 +608,8 @@ fn panel_picker(
                 })
                 .style(|s| s.padding(1.0)),
                 label(|| "".to_string()).style(move |s| {
-                    s.absolute()
+                    s.selectable(false)
+                        .absolute()
                         .size_pct(100.0, 100.0)
                         .apply_if(!is_bottom && is_first, |s| s.margin_top(2.0))
                         .apply_if(!is_bottom && !is_first, |s| s.margin_top(-2.0))

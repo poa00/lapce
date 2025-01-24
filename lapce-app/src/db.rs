@@ -6,14 +6,15 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Sender};
-use floem::peniko::kurbo::Vec2;
+use floem::{peniko::kurbo::Vec2, reactive::SignalGet};
 use lapce_core::directory::Directory;
 use lapce_rpc::plugin::VoltID;
+use sha2::{Digest, Sha256};
 
 use crate::{
     app::{AppData, AppInfo},
     doc::DocInfo,
-    panel::{data::PanelOrder, kind::PanelKind, position::PanelPosition},
+    panel::{data::PanelOrder, kind::PanelKind},
     window::{WindowData, WindowInfo},
     window_tab::WindowTabData,
     workspace::{LapceWorkspace, WorkspaceInfo},
@@ -50,7 +51,9 @@ impl LapceDb {
             .ok_or_else(|| anyhow!("can't get config directory"))?
             .join("db");
         let workspace_folder = folder.join("workspaces");
-        let _ = std::fs::create_dir_all(&workspace_folder);
+        if let Err(err) = std::fs::create_dir_all(&workspace_folder) {
+            tracing::error!("{:?}", err);
+        }
 
         let (save_tx, save_rx) = unbounded();
 
@@ -60,35 +63,57 @@ impl LapceDb {
             folder,
         };
         let local_db = db.clone();
-        std::thread::spawn(move || -> Result<()> {
-            loop {
-                let event = save_rx.recv()?;
-                match event {
-                    SaveEvent::App(info) => {
-                        let _ = local_db.insert_app_info(info);
-                    }
-                    SaveEvent::Workspace(workspace, info) => {
-                        let _ = local_db.insert_workspace(&workspace, &info);
-                    }
-                    SaveEvent::RecentWorkspace(workspace) => {
-                        let _ = local_db.insert_recent_workspace(workspace);
-                    }
-                    SaveEvent::Doc(info) => {
-                        let _ = local_db.insert_doc(&info);
-                    }
-                    SaveEvent::DisabledVolts(volts) => {
-                        let _ = local_db.insert_disabled_volts(volts);
-                    }
-                    SaveEvent::WorkspaceDisabledVolts(workspace, volts) => {
-                        let _ = local_db
-                            .insert_workspace_disabled_volts(workspace, volts);
-                    }
-                    SaveEvent::PanelOrder(order) => {
-                        let _ = local_db.insert_panel_orders(&order);
+        std::thread::Builder::new()
+            .name("SaveEventHandler".to_owned())
+            .spawn(move || -> Result<()> {
+                loop {
+                    let event = save_rx.recv()?;
+                    match event {
+                        SaveEvent::App(info) => {
+                            if let Err(err) = local_db.insert_app_info(info) {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
+                        SaveEvent::Workspace(workspace, info) => {
+                            if let Err(err) =
+                                local_db.insert_workspace(&workspace, &info)
+                            {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
+                        SaveEvent::RecentWorkspace(workspace) => {
+                            if let Err(err) =
+                                local_db.insert_recent_workspace(workspace)
+                            {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
+                        SaveEvent::Doc(info) => {
+                            if let Err(err) = local_db.insert_doc(&info) {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
+                        SaveEvent::DisabledVolts(volts) => {
+                            if let Err(err) = local_db.insert_disabled_volts(volts) {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
+                        SaveEvent::WorkspaceDisabledVolts(workspace, volts) => {
+                            if let Err(err) = local_db
+                                .insert_workspace_disabled_volts(workspace, volts)
+                            {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
+                        SaveEvent::PanelOrder(order) => {
+                            if let Err(err) = local_db.insert_panel_orders(&order) {
+                                tracing::error!("{:?}", err);
+                            }
+                        }
                     }
                 }
-            }
-        });
+            })
+            .unwrap();
         Ok(db)
     }
 
@@ -99,7 +124,9 @@ impl LapceDb {
     }
 
     pub fn save_disabled_volts(&self, volts: Vec<VoltID>) {
-        let _ = self.save_tx.send(SaveEvent::DisabledVolts(volts));
+        if let Err(err) = self.save_tx.send(SaveEvent::DisabledVolts(volts)) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn save_workspace_disabled_volts(
@@ -107,9 +134,12 @@ impl LapceDb {
         workspace: Arc<LapceWorkspace>,
         volts: Vec<VoltID>,
     ) {
-        let _ = self
+        if let Err(err) = self
             .save_tx
-            .send(SaveEvent::WorkspaceDisabledVolts(workspace, volts));
+            .send(SaveEvent::WorkspaceDisabledVolts(workspace, volts))
+        {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn insert_disabled_volts(&self, volts: Vec<VoltID>) -> Result<()> {
@@ -126,7 +156,9 @@ impl LapceDb {
         let folder = self
             .workspace_folder
             .join(workspace_folder_name(&workspace));
-        let _ = std::fs::create_dir_all(&folder);
+        if let Err(err) = std::fs::create_dir_all(&folder) {
+            tracing::error!("{:?}", err);
+        }
 
         let volts = serde_json::to_string_pretty(&volts)?;
         std::fs::write(folder.join(DISABLED_VOLTS), volts)?;
@@ -218,7 +250,9 @@ impl LapceDb {
         info: &WorkspaceInfo,
     ) -> Result<()> {
         let folder = self.workspace_folder.join(workspace_folder_name(workspace));
-        let _ = std::fs::create_dir_all(&folder);
+        if let Err(err) = std::fs::create_dir_all(&folder) {
+            tracing::error!("{:?}", err);
+        }
         let workspace_info = serde_json::to_string_pretty(info)?;
         std::fs::write(folder.join(WORKSPACE_INFO), workspace_info)?;
         Ok(())
@@ -227,7 +261,9 @@ impl LapceDb {
     pub fn save_app(&self, data: &AppData) -> Result<()> {
         let windows = data.windows.get_untracked();
         for (_, window) in &windows {
-            let _ = self.save_window(window.clone());
+            if let Err(err) = self.save_window(window.clone()) {
+                tracing::error!("{:?}", err);
+            }
         }
 
         let info = AppInfo {
@@ -258,7 +294,9 @@ impl LapceDb {
             return Ok(());
         }
         for (_, window) in &windows {
-            let _ = self.insert_window(window.clone());
+            if let Err(err) = self.insert_window(window.clone()) {
+                tracing::error!("{:?}", err);
+            }
         }
         let info = AppInfo {
             windows: windows
@@ -298,14 +336,18 @@ impl LapceDb {
 
     pub fn save_window(&self, data: WindowData) -> Result<()> {
         for (_, window_tab) in data.window_tabs.get_untracked().into_iter() {
-            let _ = self.save_window_tab(window_tab);
+            if let Err(err) = self.save_window_tab(window_tab) {
+                tracing::error!("{:?}", err);
+            }
         }
         Ok(())
     }
 
     pub fn insert_window(&self, data: WindowData) -> Result<()> {
         for (_, window_tab) in data.window_tabs.get_untracked().into_iter() {
-            let _ = self.insert_window_tab(window_tab);
+            if let Err(err) = self.insert_window_tab(window_tab) {
+                tracing::error!("{:?}", err);
+            }
         }
         let info = data.info();
         let info = serde_json::to_string_pretty(&info)?;
@@ -330,7 +372,8 @@ impl LapceDb {
         use strum::IntoEnumIterator;
         for kind in PanelKind::iter() {
             if kind.position(&panel_orders).is_none() {
-                let panels = panel_orders.entry(PanelPosition::LeftTop).or_default();
+                let panels =
+                    panel_orders.entry(kind.default_position()).or_default();
                 panels.push_back(kind);
             }
         }
@@ -339,7 +382,9 @@ impl LapceDb {
     }
 
     pub fn save_panel_orders(&self, order: PanelOrder) {
-        let _ = self.save_tx.send(SaveEvent::PanelOrder(order));
+        if let Err(err) = self.save_tx.send(SaveEvent::PanelOrder(order)) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn insert_panel_orders(&self, order: &PanelOrder) -> Result<()> {
@@ -361,7 +406,9 @@ impl LapceDb {
             scroll_offset: (scroll_offset.x, scroll_offset.y),
             cursor_offset,
         };
-        let _ = self.save_tx.send(SaveEvent::Doc(info));
+        if let Err(err) = self.save_tx.send(SaveEvent::Doc(info)) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn insert_doc(&self, info: &DocInfo) -> Result<()> {
@@ -369,7 +416,9 @@ impl LapceDb {
             .workspace_folder
             .join(workspace_folder_name(&info.workspace))
             .join(WORKSPACE_FILES);
-        let _ = std::fs::create_dir_all(&folder);
+        if let Err(err) = std::fs::create_dir_all(&folder) {
+            tracing::error!("{:?}", err);
+        }
         let contents = serde_json::to_string_pretty(info)?;
         std::fs::write(folder.join(doc_path_name(&info.path)), contents)?;
         Ok(())
@@ -397,7 +446,7 @@ fn workspace_folder_name(workspace: &LapceWorkspace) -> String {
 }
 
 fn doc_path_name(path: &Path) -> String {
-    url::form_urlencoded::Serializer::new(String::new())
-        .append_key_only(&path.to_string_lossy())
-        .finish()
+    let mut hasher = Sha256::new();
+    hasher.update(path.to_string_lossy().as_bytes());
+    format!("{:x}", hasher.finalize())
 }

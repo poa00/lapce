@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use flate2::read::GzDecoder;
-use lapce_core::{directory::Directory, meta};
+use lapce_core::{
+    directory::Directory,
+    meta::{self, ReleaseType},
+};
 use lapce_rpc::{
     core::CoreRpcHandler,
     proxy::{ProxyRpc, ProxyRpcHandler},
@@ -51,6 +54,7 @@ enum HostArchitecture {
 }
 
 pub trait Remote: Sized {
+    #[allow(unused)]
     fn home_dir(&self) -> Result<String> {
         let cmd = self
             .command_builder()
@@ -117,7 +121,7 @@ pub fn start_remote(
         .args([&remote_proxy_file, "--version"])
         .output()
         .map(|output| {
-            if meta::VERSION == "debug" {
+            if meta::RELEASE == ReleaseType::Debug {
                 String::from_utf8_lossy(&output.stdout).starts_with("Lapce-proxy")
             } else {
                 String::from_utf8_lossy(&output.stdout).trim()
@@ -173,51 +177,77 @@ pub fn start_remote(
 
     let local_proxy_rpc = proxy_rpc.clone();
     let local_writer_tx = writer_tx.clone();
-    std::thread::spawn(move || {
-        for msg in local_proxy_rpc.rx() {
-            match msg {
-                ProxyRpc::Request(id, rpc) => {
-                    let _ = local_writer_tx.send(RpcMessage::Request(id, rpc));
-                }
-                ProxyRpc::Notification(rpc) => {
-                    let _ = local_writer_tx.send(RpcMessage::Notification(rpc));
-                }
-                ProxyRpc::Shutdown => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return;
+    std::thread::Builder::new()
+        .name("ProxyRpcHandler".to_owned())
+        .spawn(move || {
+            for msg in local_proxy_rpc.rx() {
+                match msg {
+                    ProxyRpc::Request(id, rpc) => {
+                        if let Err(err) =
+                            local_writer_tx.send(RpcMessage::Request(id, rpc))
+                        {
+                            tracing::error!("{:?}", err);
+                        }
+                    }
+                    ProxyRpc::Notification(rpc) => {
+                        if let Err(err) =
+                            local_writer_tx.send(RpcMessage::Notification(rpc))
+                        {
+                            tracing::error!("{:?}", err);
+                        }
+                    }
+                    ProxyRpc::Shutdown => {
+                        if let Err(err) = child.kill() {
+                            tracing::error!("{:?}", err);
+                        }
+                        if let Err(err) = child.wait() {
+                            tracing::error!("{:?}", err);
+                        }
+                        return;
+                    }
                 }
             }
-        }
-    });
+        })
+        .unwrap();
 
-    std::thread::spawn(move || {
-        for msg in reader_rx {
-            match msg {
-                RpcMessage::Request(id, req) => {
-                    let writer_tx = writer_tx.clone();
-                    let core_rpc = core_rpc.clone();
-                    std::thread::spawn(move || match core_rpc.request(req) {
-                        Ok(resp) => {
-                            let _ = writer_tx.send(RpcMessage::Response(id, resp));
-                        }
-                        Err(e) => {
-                            let _ = writer_tx.send(RpcMessage::Error(id, e));
-                        }
-                    });
-                }
-                RpcMessage::Notification(n) => {
-                    core_rpc.notification(n);
-                }
-                RpcMessage::Response(id, resp) => {
-                    proxy_rpc.handle_response(id, Ok(resp));
-                }
-                RpcMessage::Error(id, err) => {
-                    proxy_rpc.handle_response(id, Err(err));
+    std::thread::Builder::new()
+        .name("RpcMessageHandler".to_owned())
+        .spawn(move || {
+            for msg in reader_rx {
+                match msg {
+                    RpcMessage::Request(id, req) => {
+                        let writer_tx = writer_tx.clone();
+                        let core_rpc = core_rpc.clone();
+                        std::thread::spawn(move || match core_rpc.request(req) {
+                            Ok(resp) => {
+                                if let Err(err) =
+                                    writer_tx.send(RpcMessage::Response(id, resp))
+                                {
+                                    tracing::error!("{:?}", err);
+                                }
+                            }
+                            Err(e) => {
+                                if let Err(err) =
+                                    writer_tx.send(RpcMessage::Error(id, e))
+                                {
+                                    tracing::error!("{:?}", err);
+                                }
+                            }
+                        });
+                    }
+                    RpcMessage::Notification(n) => {
+                        core_rpc.notification(n);
+                    }
+                    RpcMessage::Response(id, resp) => {
+                        proxy_rpc.handle_response(id, Ok(resp));
+                    }
+                    RpcMessage::Error(id, err) => {
+                        proxy_rpc.handle_response(id, Err(err));
+                    }
                 }
             }
-        }
-    });
+        })
+        .unwrap();
 
     Ok(())
 }
@@ -266,10 +296,10 @@ fn download_remote(
         _ => {
             let proxy_script = general_purpose::STANDARD.encode(UNIX_PROXY_SCRIPT);
 
-            let version = if meta::VERSION == "debug" {
-                "nightly"
-            } else {
-                meta::VERSION
+            let version = match meta::RELEASE {
+                ReleaseType::Debug => "nightly".to_string(),
+                ReleaseType::Nightly => "nightly".to_string(),
+                ReleaseType::Stable => format!("v{}", meta::VERSION),
             };
             let cmd = remote
                 .command_builder()
@@ -282,7 +312,7 @@ fn download_remote(
                     "|",
                     "sh",
                     "/dev/stdin",
-                    version,
+                    &version,
                     remote_proxy_path,
                 ])
                 .output()?;
@@ -318,10 +348,13 @@ fn download_remote(
                 // when needed
                 std::fs::remove_file(&local_proxy_file)?;
             }
-            let proxy_version = meta::VERSION;
+            let proxy_version = match meta::RELEASE {
+                meta::ReleaseType::Stable => meta::VERSION,
+                _ => "nightly",
+            };
             let url = format!("https://github.com/lapce/lapce/releases/download/{proxy_version}/{proxy_filename}.gz");
             debug!("proxy download URI: {url}");
-            let mut resp = reqwest::blocking::get(url).expect("request failed");
+            let mut resp = lapce_proxy::get_url(url, None).expect("request failed");
             if resp.status().is_success() {
                 let mut out = std::fs::File::create(&local_proxy_file)
                     .expect("failed to create file");

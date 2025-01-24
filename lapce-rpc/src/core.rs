@@ -9,8 +9,8 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use lsp_types::{
-    CompletionResponse, LogMessageParams, ProgressParams, PublishDiagnosticsParams,
-    ShowMessageParams, SignatureHelp,
+    CancelParams, CompletionResponse, LogMessageParams, ProgressParams,
+    PublishDiagnosticsParams, ShowMessageParams, SignatureHelp,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,13 @@ pub enum CoreRpc {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FileChanged {
+    Change(String),
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[serde(tag = "method", content = "params")]
 pub enum CoreNotification {
     ProxyStatus {
@@ -42,7 +49,7 @@ pub enum CoreNotification {
     },
     OpenFileChanged {
         path: PathBuf,
-        content: String,
+        content: FileChanged,
     },
     CompletionResponse {
         request_id: usize,
@@ -62,6 +69,9 @@ pub enum CoreNotification {
     PublishDiagnostics {
         diagnostics: PublishDiagnosticsParams,
     },
+    ServerStatus {
+        params: ServerStatusParams,
+    },
     WorkDoneProgress {
         progress: ProgressParams,
     },
@@ -72,6 +82,9 @@ pub enum CoreNotification {
     LogMessage {
         message: LogMessageParams,
         target: String,
+    },
+    LspCancel {
+        params: CancelParams,
     },
     HomeDir {
         path: PathBuf,
@@ -109,6 +122,7 @@ pub enum CoreNotification {
     },
     TerminalProcessStopped {
         term_id: TermId,
+        exit_code: Option<i32>,
     },
     RunInTerminal {
         config: RunDebugConfig,
@@ -199,7 +213,9 @@ impl CoreRpcHandler {
     ) {
         let tx = { self.pending.lock().remove(&id) };
         if let Some(tx) = tx {
-            let _ = tx.send(response);
+            if let Err(err) = tx.send(response) {
+                tracing::error!("{:?}", err);
+            }
         }
     }
 
@@ -210,7 +226,9 @@ impl CoreRpcHandler {
             let mut pending = self.pending.lock();
             pending.insert(id, tx);
         }
-        let _ = self.tx.send(CoreRpc::Request(id, request));
+        if let Err(err) = self.tx.send(CoreRpc::Request(id, request)) {
+            tracing::error!("{:?}", err);
+        }
         rx.recv().unwrap_or_else(|_| {
             Err(RpcError {
                 code: 0,
@@ -220,11 +238,16 @@ impl CoreRpcHandler {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.tx.send(CoreRpc::Shutdown);
+        if let Err(err) = self.tx.send(CoreRpc::Shutdown) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn notification(&self, notification: CoreNotification) {
-        let _ = self.tx.send(CoreRpc::Notification(Box::new(notification)));
+        if let Err(err) = self.tx.send(CoreRpc::Notification(Box::new(notification)))
+        {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn workspace_file_change(&self) {
@@ -235,7 +258,7 @@ impl CoreRpcHandler {
         self.notification(CoreNotification::DiffInfo { diff });
     }
 
-    pub fn open_file_changed(&self, path: PathBuf, content: String) {
+    pub fn open_file_changed(&self, path: PathBuf, content: FileChanged) {
         self.notification(CoreNotification::OpenFileChanged { path, content });
     }
 
@@ -302,6 +325,10 @@ impl CoreRpcHandler {
         self.notification(CoreNotification::PublishDiagnostics { diagnostics });
     }
 
+    pub fn server_status(&self, params: ServerStatusParams) {
+        self.notification(CoreNotification::ServerStatus { params });
+    }
+
     pub fn work_done_progress(&self, progress: ProgressParams) {
         self.notification(CoreNotification::WorkDoneProgress { progress });
     }
@@ -314,6 +341,10 @@ impl CoreRpcHandler {
         self.notification(CoreNotification::LogMessage { message, target });
     }
 
+    pub fn cancel(&self, params: CancelParams) {
+        self.notification(CoreNotification::LspCancel { params });
+    }
+
     pub fn terminal_process_id(&self, term_id: TermId, process_id: Option<u32>) {
         self.notification(CoreNotification::TerminalProcessId {
             term_id,
@@ -321,8 +352,11 @@ impl CoreRpcHandler {
         });
     }
 
-    pub fn terminal_process_stopped(&self, term_id: TermId) {
-        self.notification(CoreNotification::TerminalProcessStopped { term_id });
+    pub fn terminal_process_stopped(&self, term_id: TermId, exit_code: Option<i32>) {
+        self.notification(CoreNotification::TerminalProcessStopped {
+            term_id,
+            exit_code,
+        });
     }
 
     pub fn terminal_launch_failed(&self, term_id: TermId, error: String) {
@@ -383,4 +417,17 @@ pub enum LogLevel {
     Error = 2,
     Debug = 3,
     Trace = 4,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerStatusParams {
+    health: String,
+    quiescent: bool,
+    pub message: Option<String>,
+}
+
+impl ServerStatusParams {
+    pub fn is_ok(&self) -> bool {
+        self.health.as_str() == "ok"
+    }
 }

@@ -2,8 +2,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use floem::{
-    cosmic_text::{Attrs, AttrsList, FamilyOwned, TextLayout, Wrap},
     reactive::Scope,
+    text::{Attrs, AttrsList, FamilyOwned, TextLayout, Wrap},
     views::editor::{
         layout::TextLayoutLine,
         phantom_text::PhantomTextLine,
@@ -116,6 +116,7 @@ impl<'a> TextLayoutProvider for TLProv<'a> {
             text: text_layout,
             whitespaces: None,
             indent: 0.0,
+            phantom_text: PhantomTextLine::default(),
         })
     }
 

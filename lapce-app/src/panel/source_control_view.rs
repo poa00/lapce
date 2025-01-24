@@ -5,20 +5,21 @@ use floem::{
     event::{Event, EventListener},
     menu::{Menu, MenuItem},
     peniko::kurbo::Rect,
-    reactive::{create_memo, create_rw_signal},
+    reactive::{create_memo, create_rw_signal, SignalGet, SignalUpdate, SignalWith},
     style::{CursorStyle, Style},
-    view::View,
     views::{
         container, dyn_stack,
         editor::view::{cursor_caret, LineRegion},
         label, scroll, stack, svg, text, Decorators,
     },
+    View,
 };
 use lapce_core::buffer::rope_text::RopeText;
 use lapce_rpc::source_control::FileDiff;
 
 use super::{
-    kind::PanelKind, position::PanelPosition, view::foldable_panel_section,
+    data::PanelSection, kind::PanelKind, position::PanelPosition,
+    view::foldable_panel_section,
 };
 use crate::{
     command::{CommandKind, InternalCommand, LapceCommand, LapceWorkbenchCommand},
@@ -65,8 +66,7 @@ pub fn source_control_panel(
                             editor.get_untracked(),
                             debug_breakline,
                             is_active,
-                        )
-                        .style(|s| s.min_size_pct(100.0, 100.0)),
+                        ),
                         label(|| "Commit Message".to_string()).style(move |s| {
                             let config = config.get();
                             s.absolute()
@@ -74,6 +74,7 @@ pub fn source_control_panel(
                                 .height(config.editor.line_height() as f32)
                                 .color(config.color(LapceColor::EDITOR_DIM))
                                 .apply_if(!is_empty.get(), |s| s.hide())
+                                .selectable(false)
                         }),
                     ))
                     .style(|s| {
@@ -173,6 +174,7 @@ pub fn source_control_panel(
                                     LapceColor::PANEL_HOVERED_ACTIVE_BACKGROUND,
                                 ))
                             })
+                            .selectable(false)
                     })
             },
         ))
@@ -180,6 +182,7 @@ pub fn source_control_panel(
         foldable_panel_section(
             text("Changes"),
             file_diffs_view(source_control),
+            window_tab_data.panel.section_open(PanelSection::Changes),
             config,
         )
         .style(|s| s.flex_col().size_pct(100.0, 100.0)),
@@ -190,6 +193,7 @@ pub fn source_control_panel(
         }
     })
     .style(|s| s.flex_col().size_pct(100.0, 100.0))
+    .debug_name("Source Control Panel")
 }
 
 fn file_diffs_view(source_control: SourceControlData) -> impl View {
@@ -256,7 +260,10 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
                     - 10.0
                     - size
                     - 6.0;
-                s.text_ellipsis().margin_right(6.0).max_width(max_width)
+                s.text_ellipsis()
+                    .margin_right(6.0)
+                    .max_width(max_width)
+                    .selectable(false)
             }),
             label(move || folder.clone()).style(move |s| {
                 s.text_ellipsis()
@@ -264,6 +271,7 @@ fn file_diffs_view(source_control: SourceControlData) -> impl View {
                     .flex_basis(0.0)
                     .color(config.get().color(LapceColor::EDITOR_DIM))
                     .min_width(0.0)
+                    .selectable(false)
             }),
             container({
                 svg(move || {

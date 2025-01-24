@@ -7,17 +7,24 @@ use std::{
     time::Instant,
 };
 
+use alacritty_terminal::vte::ansi::Handler;
 use crossbeam_channel::Sender;
 use floem::{
-    action::{open_file, TimerToken},
-    cosmic_text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout},
+    action::{open_file, remove_overlay, TimerToken},
     ext_event::{create_ext_action, create_signal_from_channel},
     file::FileDialogOptions,
     keyboard::Modifiers,
     kurbo::Size,
     peniko::kurbo::{Point, Rect, Vec2},
-    reactive::{use_context, Memo, ReadSignal, RwSignal, Scope, WriteSignal},
+    reactive::{
+        use_context, Memo, ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate,
+        SignalWith, WriteSignal,
+    },
+    text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout},
+    views::editor::core::buffer::rope_text::RopeText,
+    ViewId,
 };
+use im::HashMap;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use lapce_core::{
@@ -26,16 +33,20 @@ use lapce_core::{
 };
 use lapce_rpc::{
     core::CoreNotification,
-    dap_types::RunDebugConfig,
+    dap_types::{ConfigSource, RunDebugConfig},
     file::{Naming, PathObject},
+    plugin::PluginId,
     proxy::{ProxyResponse, ProxyRpcHandler, ProxyStatus},
     source_control::FileDiff,
     terminal::TermId,
     RpcError,
 };
-use lsp_types::{ProgressParams, ProgressToken, ShowMessageParams};
+use lsp_types::{
+    CodeActionOrCommand, CodeLens, Diagnostic, ProgressParams, ProgressToken,
+    ShowMessageParams,
+};
 use serde_json::Value;
-use tracing::{debug, error};
+use tracing::{debug, error, event, Level};
 
 use crate::{
     about::AboutData,
@@ -49,7 +60,7 @@ use crate::{
     config::LapceConfig,
     db::LapceDb,
     debug::{DapData, LapceBreakpoint, RunDebugMode, RunDebugProcess},
-    doc::{DocContent, EditorDiagnostic},
+    doc::DocContent,
     editor::location::{EditorLocation, EditorPosition},
     editor_tab::EditorTabChild,
     file_explorer::data::FileExplorerData,
@@ -60,21 +71,24 @@ use crate::{
     inline_completion::InlineCompletionData,
     keypress::{condition::Condition, EventRef, KeyPressData, KeyPressFocus},
     listener::Listener,
+    lsp::path_from_url,
     main_split::{MainSplitData, SplitData, SplitDirection, SplitMoveDirection},
-    palette::{kind::PaletteKind, PaletteData, PaletteStatus},
+    palette::{kind::PaletteKind, PaletteData, PaletteStatus, DEFAULT_RUN_TOML},
     panel::{
-        data::{default_panel_order, PanelData},
+        call_hierarchy_view::{CallHierarchyData, CallHierarchyItemData},
+        data::{default_panel_order, PanelData, PanelSection},
         kind::PanelKind,
         position::PanelContainerPosition,
     },
     plugin::PluginData,
-    proxy::{new_proxy, path_from_url, ProxyData},
+    proxy::{new_proxy, ProxyData},
     rename::RenameData,
     source_control::SourceControlData,
     terminal::{
         event::{terminal_update_process, TermEvent, TermNotification},
         panel::TerminalPanelData,
     },
+    tracing::*,
     window::WindowCommonData,
     workspace::{LapceWorkspace, LapceWorkspaceType, WorkspaceInfo},
 };
@@ -128,7 +142,7 @@ pub struct CommonData {
     pub term_tx: Sender<(TermId, TermEvent)>,
     pub term_notification_tx: Sender<TermNotification>,
     pub proxy: ProxyRpcHandler,
-    pub view_id: RwSignal<floem::id::Id>,
+    pub view_id: RwSignal<ViewId>,
     pub ui_line_height: Memo<f64>,
     pub dragging: RwSignal<Option<DragContent>>,
     pub config: ReadSignal<Arc<LapceConfig>>,
@@ -136,8 +150,16 @@ pub struct CommonData {
     pub mouse_hover_timer: RwSignal<TimerToken>,
     pub breakpoints: RwSignal<BTreeMap<PathBuf, BTreeMap<usize, LapceBreakpoint>>>,
     // the current focused view which will receive keyboard events
-    pub keyboard_focus: RwSignal<Option<floem::id::Id>>,
+    pub keyboard_focus: RwSignal<Option<ViewId>>,
     pub window_common: Rc<WindowCommonData>,
+}
+
+impl std::fmt::Debug for CommonData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommonData")
+            .field("workspace", &self.workspace)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -152,9 +174,11 @@ pub struct WindowTabData {
     pub terminal: TerminalPanelData,
     pub plugin: PluginData,
     pub code_action: RwSignal<CodeActionData>,
+    pub code_lens: RwSignal<Option<ViewId>>,
     pub source_control: SourceControlData,
     pub rename: RenameData,
     pub global_search: GlobalSearchData,
+    pub call_hierarchy_data: CallHierarchyData,
     pub about_data: AboutData,
     pub alert_data: AlertBoxData,
     pub layout_rect: RwSignal<Rect>,
@@ -166,6 +190,14 @@ pub struct WindowTabData {
     pub progresses: RwSignal<IndexMap<ProgressToken, WorkProgress>>,
     pub messages: RwSignal<Vec<(String, ShowMessageParams)>>,
     pub common: Rc<CommonData>,
+}
+
+impl std::fmt::Debug for WindowTabData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowTabData")
+            .field("window_tab_id", &self.window_tab_id)
+            .finish()
+    }
 }
 
 impl KeyPressFocus for WindowTabData {
@@ -287,9 +319,12 @@ impl WindowTabData {
             crossbeam_channel::unbounded();
         {
             let term_notification_tx = term_notification_tx.clone();
-            std::thread::spawn(move || {
-                terminal_update_process(term_rx, term_notification_tx);
-            });
+            std::thread::Builder::new()
+                .name("terminal update process".to_owned())
+                .spawn(move || {
+                    terminal_update_process(term_rx, term_notification_tx);
+                })
+                .unwrap();
         }
 
         let proxy = new_proxy(
@@ -307,7 +342,7 @@ impl WindowTabData {
         let hover = HoverData::new(cx);
 
         let register = cx.create_rw_signal(Register::default());
-        let view_id = cx.create_rw_signal(floem::id::Id::next());
+        let view_id = cx.create_rw_signal(ViewId::new());
         let find = Find::new(cx);
 
         let ui_line_height = cx.create_memo(move |_| {
@@ -319,7 +354,7 @@ impl WindowTabData {
             let attrs = Attrs::new()
                 .family(&family)
                 .font_size(config.ui.font_size() as f32)
-                .line_height(LineHeightValue::Normal(1.6));
+                .line_height(LineHeightValue::Normal(1.8));
             let attrs_list = AttrsList::new(attrs);
             text_layout.set_text("W", attrs_list);
             text_layout.size().height
@@ -418,12 +453,19 @@ impl WindowTabData {
             .map(|i| {
                 let panel_order = db
                     .get_panel_orders()
-                    .unwrap_or_else(|_| i.panel.panels.clone());
+                    .unwrap_or_else(|_| default_panel_order());
                 PanelData {
                     panels: cx.create_rw_signal(panel_order),
                     styles: cx.create_rw_signal(i.panel.styles.clone()),
                     size: cx.create_rw_signal(i.panel.size.clone()),
                     available_size: panel_available_size,
+                    sections: cx.create_rw_signal(
+                        i.panel
+                            .sections
+                            .iter()
+                            .map(|(key, value)| (*key, cx.create_rw_signal(*value)))
+                            .collect(),
+                    ),
                     common: common.clone(),
                 }
             })
@@ -431,11 +473,21 @@ impl WindowTabData {
                 let panel_order = db
                     .get_panel_orders()
                     .unwrap_or_else(|_| default_panel_order());
-                PanelData::new(cx, panel_order, panel_available_size, common.clone())
+                PanelData::new(
+                    cx,
+                    panel_order,
+                    panel_available_size,
+                    im::HashMap::new(),
+                    common.clone(),
+                )
             });
 
-        let terminal =
-            TerminalPanelData::new(workspace.clone(), None, common.clone());
+        let terminal = TerminalPanelData::new(
+            workspace.clone(),
+            common.config.get_untracked().terminal.get_default_profile(),
+            common.clone(),
+            main_split.clone(),
+        );
         if let Some(workspace_info) = workspace_info.as_ref() {
             terminal.debug.breakpoints.set(
                 workspace_info
@@ -464,6 +516,7 @@ impl WindowTabData {
             HashSet::from_iter(workspace_disabled_volts),
             main_split.editors,
             common.clone(),
+            proxy.core_rpc.clone(),
         );
 
         {
@@ -498,10 +551,16 @@ impl WindowTabData {
             panel,
             file_explorer,
             code_action,
+            code_lens: cx.create_rw_signal(None),
             source_control,
             plugin,
             rename,
             global_search,
+            call_hierarchy_data: CallHierarchyData {
+                root: cx.create_rw_signal(None),
+                common: common.clone(),
+                scroll_to_line: cx.create_rw_signal(None),
+            },
             about_data,
             alert_data,
             layout_rect: cx.create_rw_signal(Rect::ZERO),
@@ -586,7 +645,46 @@ impl WindowTabData {
         self.common.keypress.update(|keypress| {
             keypress.update_keymaps(&config);
         });
-        self.set_config.set(Arc::new(config));
+
+        let mut change_plugins = Vec::new();
+        for (key, configs) in self.common.config.get_untracked().plugins.iter() {
+            if config
+                .plugins
+                .get(key)
+                .map(|x| x != configs)
+                .unwrap_or_default()
+            {
+                change_plugins.push(key.clone());
+            }
+        }
+        self.set_config.set(Arc::new(config.clone()));
+        if !change_plugins.is_empty() {
+            self.common
+                .proxy
+                .update_plugin_configs(config.plugins.clone());
+            if config.core.auto_reload_plugin {
+                let mut plugin_metas: HashMap<
+                    String,
+                    lapce_rpc::plugin::VoltMetadata,
+                > = self
+                    .plugin
+                    .installed
+                    .get_untracked()
+                    .values()
+                    .map(|x| {
+                        let meta = x.meta.get_untracked();
+                        (meta.name.clone(), meta)
+                    })
+                    .collect();
+                for name in change_plugins {
+                    if let Some(meta) = plugin_metas.remove(&name) {
+                        self.common.proxy.reload_volt(meta);
+                    } else {
+                        tracing::error!("not found volt metadata of {}", name);
+                    }
+                }
+            }
+        }
     }
 
     pub fn run_lapce_command(&self, cmd: LapceCommand) {
@@ -634,7 +732,12 @@ impl WindowTabData {
             OpenFolder => {
                 if !self.workspace.kind.is_remote() {
                     let window_command = self.common.window_common.window_command;
-                    let options = FileDialogOptions::new().select_directories();
+                    let mut options = FileDialogOptions::new().select_directories();
+                    options = if let Some(parent) = self.workspace.path.as_ref().and_then(|x| x.parent()) {
+                        options.force_starting_directory(parent)
+                    } else {
+                        options
+                    };
                     open_file(options, move |file| {
                         if let Some(mut file) = file {
                             let workspace = LapceWorkspace {
@@ -802,6 +905,16 @@ impl WindowTabData {
             }
             OpenPluginsDirectory => {
                 if let Some(dir) = Directory::plugins_directory() {
+                    open_uri(&dir);
+                }
+            }
+            OpenGrammarsDirectory => {
+                if let Some(dir) = Directory::grammars_directory() {
+                    open_uri(&dir);
+                }
+            }
+            OpenQueriesDirectory => {
+                if let Some(dir) = Directory::queries_directory() {
                     open_uri(&dir);
                 }
             }
@@ -989,6 +1102,7 @@ impl WindowTabData {
 
             // ==== Palette Commands ====
             PaletteHelp => self.palette.run(PaletteKind::PaletteHelp),
+            PaletteHelpAndFile => self.palette.run(PaletteKind::HelpAndFile),
             PaletteLine => {
                 self.palette.run(PaletteKind::Line);
             }
@@ -1028,10 +1142,14 @@ impl WindowTabData {
             // ==== Running / Debugging ====
             RunAndDebugRestart => {
                 let active_term = self.terminal.debug.active_term.get_untracked();
-                if active_term
+                if let Some(is_debug) = active_term
                     .and_then(|term_id| self.terminal.restart_run_debug(term_id))
-                    .is_none()
                 {
+                    self.panel.show_panel(&PanelKind::Terminal);
+                    if is_debug {
+                        self.panel.show_panel(&PanelKind::Debug);
+                    }
+                } else {
                     self.palette.run(PaletteKind::RunAndDebug);
                 }
             }
@@ -1051,6 +1169,12 @@ impl WindowTabData {
                     scale = 4.0
                 }
                 self.common.window_common.window_scale.set(scale);
+
+                LapceConfig::update_file(
+                    "ui",
+                    "scale",
+                    toml_edit::Value::from(scale),
+                );
             }
             ZoomOut => {
                 let mut scale =
@@ -1060,9 +1184,21 @@ impl WindowTabData {
                     scale = 0.1
                 }
                 self.common.window_common.window_scale.set(scale);
+
+                LapceConfig::update_file(
+                    "ui",
+                    "scale",
+                    toml_edit::Value::from(scale),
+                );
             }
             ZoomReset => {
                 self.common.window_common.window_scale.set(1.0);
+
+                LapceConfig::update_file(
+                    "ui",
+                    "scale",
+                    toml_edit::Value::from(1.0),
+                );
             }
 
             ToggleMaximizedPanel => {
@@ -1159,6 +1295,9 @@ impl WindowTabData {
             OpenUIInspector => {
                 self.common.view_id.get_untracked().inspect();
             }
+            ShowEnvironment => {
+                self.main_split.show_env();
+            }
 
             // ==== Source Control ====
             SourceControlInit => {
@@ -1230,7 +1369,7 @@ impl WindowTabData {
                                     update_in_progress.set(false);
                                 },
                             );
-                            std::thread::spawn(move || {
+                            std::thread::Builder::new().name("RestartToUpdate".to_owned()).spawn(move || {
                                 let do_update = || -> anyhow::Result<()> {
                                     let src =
                                         crate::update::download_release(&release)?;
@@ -1248,7 +1387,7 @@ impl WindowTabData {
                                 }
 
                                 send(false);
-                            });
+                            }).unwrap();
                         }
                     }
                 }
@@ -1256,9 +1395,23 @@ impl WindowTabData {
 
             // ==== Movement ====
             #[cfg(target_os = "macos")]
-            InstallToPATH => {}
+            InstallToPATH => {
+                self.common.internal_command.send(
+                    InternalCommand::ExecuteProcess {
+                        program: String::from("osascript"),
+                        arguments: vec![String::from("-e"), format!(r#"do shell script "ln -sf '{}' /usr/local/bin/lapce" with administrator privileges"#, std::env::args().next().unwrap())],
+                    }
+                )
+            }
             #[cfg(target_os = "macos")]
-            UninstallFromPATH => {}
+            UninstallFromPATH => {
+                self.common.internal_command.send(
+                    InternalCommand::ExecuteProcess {
+                        program: String::from("osascript"),
+                        arguments: vec![String::from("-e"), String::from(r#"do shell script "rm /usr/local/bin/lapce" with administrator privileges"#)],
+                    }
+                )
+            }
             JumpLocationForward => {
                 self.main_split.jump_location_forward(false);
             }
@@ -1278,6 +1431,153 @@ impl WindowTabData {
             Quit => {
                 floem::quit_app();
             }
+            RevealInPanel => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    self.show_panel(PanelKind::FileExplorer);
+                    self.panel
+                        .section_open(PanelSection::FileExplorer).update(|x| {
+                        *x = true;
+                    });
+                    if let DocContent::File {path, ..} = editor_data.doc().content.get_untracked() {
+                        self.file_explorer.reveal_in_file_tree(path);
+                    }
+                }
+            }
+            SourceControlOpenActiveFileRemoteUrl => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    if let DocContent::File {path, ..} = editor_data.doc().content.get_untracked() {
+                        let offset = editor_data.cursor().with_untracked(|c| c.offset());
+                        let line = editor_data.doc()
+                            .buffer
+                            .with_untracked(|buffer| buffer.line_of_offset(offset));
+                        self.common.proxy.git_get_remote_file_url(
+                            path,
+                            create_ext_action(self.scope, move |result| {
+                                if let Ok(ProxyResponse::GitGetRemoteFileUrl {
+                                              file_url
+                                          }) = result
+                                {
+                                    if let Err(err) = open::that(format!("{}#L{}", file_url, line)) {
+                                        error!("Failed to open file in github: {}",  err);
+                                    }
+                                }
+                            }),
+                        );
+
+                    }
+                }
+            }
+            RevealInFileExplorer => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    if let DocContent::File {path, ..} = editor_data.doc().content.get_untracked() {
+                        let path = path.parent().unwrap_or(&path);
+                        if !path.exists() {
+                            return;
+                        }
+                        if let Err(err) = open::that(path) {
+                            error!(
+                            "Failed to reveal file in system file explorer: {}",
+                            err
+                        );
+                        }
+                    }
+                }
+            }
+            ShowCallHierarchy => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    editor_data.call_hierarchy(self.clone());
+                }
+            }
+            FindReferences => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    editor_data.find_refenrence(self.clone());
+                }
+            }
+            GoToImplementation => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    editor_data.go_to_implementation(self.clone());
+                }
+            }
+            RunInTerminal => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    let name = editor_data.word_at_cursor();
+                    if !name.is_empty() {
+                        let mut args_str = name.split(" ");
+                        let program = args_str.next().map(|x| x.to_string()).unwrap();
+                        let args: Vec<String> = args_str.map(|x| x.to_string()).collect();
+                        let args = if args.is_empty() {
+                            None
+                        } else {
+                            Some(args)
+                        };
+
+                        let config = RunDebugConfig {
+                            ty: None,
+                            name,
+                            program,
+                            args,
+                            cwd: None,
+                            env: None,
+                            prelaunch: None,
+                            debug_command: None,
+                            dap_id: Default::default(),
+                            tracing_output: false,
+                            config_source: ConfigSource::RunInTerminal,
+                        };
+                        self.common
+                            .internal_command
+                            .send(InternalCommand::RunAndDebug { mode: RunDebugMode::Run, config });
+                    }
+                }
+            }
+            GoToLocation => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    let doc = editor_data.doc();
+                    let path = match if doc.loaded() {
+                        doc.content.with_untracked(|c| c.path().cloned())
+                    } else {
+                        None
+                    } {
+                        Some(path) => path,
+                        None => return,
+                    };
+                    let offset = editor_data.cursor().with_untracked(|c| c.offset());
+                    let internal_command = self.common.internal_command;
+
+                    internal_command.send(InternalCommand::MakeConfirmed);
+                    internal_command.send(InternalCommand::GoToLocation { location: EditorLocation {
+                        path,
+                        position: Some(EditorPosition::Offset(offset)),
+                        scroll_offset: None,
+                        ignore_unconfirmed: false,
+                        same_editor_tab: false,
+                    } });
+                }
+            }
+            AddRunDebugConfig => {
+                if let Some(editor_data) =
+                    self.main_split.active_editor.get_untracked()
+                {
+                    editor_data.receive_char(DEFAULT_RUN_TOML);
+                }
+            }
+
         }
     }
 
@@ -1307,6 +1607,21 @@ impl WindowTabData {
                     },
                     None,
                 );
+            }
+            InternalCommand::OpenAndConfirmedFile { path } => {
+                self.main_split.jump_to_location(
+                    EditorLocation {
+                        path,
+                        position: None,
+                        scroll_offset: None,
+                        ignore_unconfirmed: false,
+                        same_editor_tab: false,
+                    },
+                    None,
+                );
+                if let Some(editor) = self.main_split.active_editor.get_untracked() {
+                    editor.confirmed.set(true);
+                }
             }
             InternalCommand::OpenFileInNewTab { path } => {
                 self.main_split.jump_to_location(
@@ -1514,13 +1829,25 @@ impl WindowTabData {
                 self.main_split
                     .editor_tab_child_close(editor_tab_id, child, false);
             }
+            InternalCommand::EditorTabCloseByKind {
+                editor_tab_id,
+                child,
+                kind,
+            } => {
+                self.main_split.editor_tab_child_close_by_kind(
+                    editor_tab_id,
+                    child,
+                    kind,
+                );
+            }
             InternalCommand::ShowCodeActions {
                 offset,
                 mouse_click,
+                plugin_id,
                 code_actions,
             } => {
                 let mut code_action = self.code_action.get_untracked();
-                code_action.show(code_actions, offset, mouse_click);
+                code_action.show(plugin_id, code_actions, offset, mouse_click);
                 self.code_action.set(code_action);
             }
             InternalCommand::RunCodeAction { plugin_id, action } => {
@@ -1634,10 +1961,13 @@ impl WindowTabData {
                 if !uri.is_empty() {
                     match open::that(&uri) {
                         Ok(_) => {
-                            debug!("opened web uri: {uri:?}");
+                            trace!(TraceLevel::TRACE, "opened web uri: {uri:?}");
                         }
                         Err(e) => {
-                            error!("failed to open web uri: {uri:?}, error: {e}");
+                            trace!(
+                                TraceLevel::ERROR,
+                                "failed to open web uri: {uri:?}, error: {e}"
+                            );
                         }
                     }
                 }
@@ -1678,6 +2008,72 @@ impl WindowTabData {
                 left_path,
                 right_path,
             } => self.main_split.open_diff_files(left_path, right_path),
+            InternalCommand::ExecuteProcess { program, arguments } => {
+                let mut cmd = match std::process::Command::new(program)
+                    .args(arguments)
+                    .spawn()
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return event!(Level::ERROR, "Failed to spawn process: {e}")
+                    }
+                };
+
+                match cmd.wait() {
+                    Ok(v) => event!(Level::TRACE, "Process exited with status {v}"),
+                    Err(e) => {
+                        event!(Level::ERROR, "Proces exited with an error: {e}")
+                    }
+                };
+            }
+            InternalCommand::ClearTerminalBuffer {
+                view_id,
+                tab_index,
+                terminal_index,
+            } => {
+                let Some(tab) = self.terminal.tab_info.with_untracked(|x| {
+                    x.tabs.iter().find_map(|(index, data)| {
+                        if index.get_untracked() == tab_index {
+                            Some(data.clone())
+                        } else {
+                            None
+                        }
+                    })
+                }) else {
+                    error!("cound not find terminal tab data: index={tab_index}");
+                    return;
+                };
+                let Some(raw) = tab.terminals.with_untracked(|x| {
+                    x.iter().find_map(|(index, data)| {
+                        if index.get_untracked() == terminal_index {
+                            Some(data.raw.get_untracked())
+                        } else {
+                            None
+                        }
+                    })
+                }) else {
+                    error!("cound not find terminal data: index={terminal_index}");
+                    return;
+                };
+                raw.write().term.reset_state();
+                view_id.request_paint();
+            }
+            InternalCommand::StopTerminal { term_id } => {
+                self.terminal.stop_run_debug(term_id);
+            }
+            InternalCommand::RestartTerminal { term_id } => {
+                if let Some(is_debug) = self.terminal.restart_run_debug(term_id) {
+                    self.panel.show_panel(&PanelKind::Terminal);
+                    if is_debug {
+                        self.panel.show_panel(&PanelKind::Debug);
+                    }
+                } else {
+                    self.palette.run(PaletteKind::RunAndDebug);
+                }
+            }
+            InternalCommand::CallHierarchyIncoming { item_id } => {
+                self.call_hierarchy_incoming(item_id);
+            }
         }
     }
 
@@ -1737,14 +2133,11 @@ impl WindowTabData {
             }
             CoreNotification::PublishDiagnostics { diagnostics } => {
                 let path = path_from_url(&diagnostics.uri);
-                let diagnostics: im::Vector<EditorDiagnostic> = diagnostics
+                let diagnostics: im::Vector<Diagnostic> = diagnostics
                     .diagnostics
-                    .iter()
-                    .map(|d| EditorDiagnostic {
-                        range: (0, 0),
-                        diagnostic: d.clone(),
-                    })
-                    .sorted_by_key(|d| d.diagnostic.range.start)
+                    .clone()
+                    .into_iter()
+                    .sorted_by_key(|d| d.range.start)
                     .collect();
 
                 self.main_split
@@ -1761,12 +2154,30 @@ impl WindowTabData {
                     doc.init_diagnostics();
                 }
             }
-            CoreNotification::TerminalProcessStopped { term_id } => {
-                let _ = self
+            CoreNotification::ServerStatus { params } => {
+                if params.is_ok() {
+                    // todo filter by language
+                    self.main_split.docs.with_untracked(|x| {
+                        for doc in x.values() {
+                            doc.get_code_lens();
+                            doc.get_document_symbol();
+                            doc.get_semantic_styles();
+                            doc.get_folding_range();
+                            doc.get_inlay_hints();
+                        }
+                    });
+                }
+            }
+            CoreNotification::TerminalProcessStopped { term_id, exit_code } => {
+                debug!("TerminalProcessStopped {:?}, {:?}", term_id, exit_code);
+                if let Err(err) = self
                     .common
                     .term_tx
-                    .send((*term_id, TermEvent::CloseTerminal));
-                self.terminal.terminal_stopped(term_id);
+                    .send((*term_id, TermEvent::CloseTerminal))
+                {
+                    tracing::error!("{:?}", err);
+                }
+                self.terminal.terminal_stopped(term_id, *exit_code);
                 if self
                     .terminal
                     .tab_info
@@ -1796,6 +2207,7 @@ impl WindowTabData {
                 stack_frames,
                 variables,
             } => {
+                self.show_panel(PanelKind::Debug);
                 self.terminal
                     .dap_stopped(dap_id, stopped, stack_frames, variables);
             }
@@ -1821,8 +2233,9 @@ impl WindowTabData {
                             if let Some(breakpoint) = breakpoints.get(i) {
                                 current_breakpoint.id = breakpoint.id;
                                 current_breakpoint.verified = breakpoint.verified;
-                                current_breakpoint.message =
-                                    breakpoint.message.clone();
+                                current_breakpoint
+                                    .message
+                                    .clone_from(&breakpoint.message);
                                 if let Some(new_line) = breakpoint.line {
                                     if current_breakpoint.line + 1 != new_line {
                                         line_changed.insert(current_breakpoint.line);
@@ -1920,37 +2333,45 @@ impl WindowTabData {
         }
         let focus = self.common.focus.get_untracked();
         let keypress = self.common.keypress.get_untracked();
-        let executed = match focus {
-            Focus::Workbench => {
-                self.main_split.key_down(event, &keypress) == Some(true)
-            }
-            Focus::Palette => keypress.key_down(event, &self.palette),
+        let handle = match focus {
+            Focus::Workbench => self.main_split.key_down(event, &keypress),
+            Focus::Palette => Some(keypress.key_down(event, &self.palette)),
             Focus::CodeAction => {
                 let code_action = self.code_action.get_untracked();
-                keypress.key_down(event, &code_action)
+                Some(keypress.key_down(event, &code_action))
             }
-            Focus::Rename => keypress.key_down(event, &self.rename),
-            Focus::AboutPopup => keypress.key_down(event, &self.about_data),
+            Focus::Rename => Some(keypress.key_down(event, &self.rename)),
+            Focus::AboutPopup => Some(keypress.key_down(event, &self.about_data)),
             Focus::Panel(PanelKind::Terminal) => {
                 self.terminal.key_down(event, &keypress)
             }
             Focus::Panel(PanelKind::Search) => {
-                keypress.key_down(event, &self.global_search)
+                Some(keypress.key_down(event, &self.global_search))
             }
             Focus::Panel(PanelKind::Plugin) => {
-                keypress.key_down(event, &self.plugin)
+                Some(keypress.key_down(event, &self.plugin))
             }
             Focus::Panel(PanelKind::SourceControl) => {
-                keypress.key_down(event, &self.source_control)
+                Some(keypress.key_down(event, &self.source_control))
             }
-            _ => false,
+            _ => None,
         };
 
-        if executed {
-            return true;
+        if let Some(handle) = &handle {
+            if handle.handled {
+                true
+            } else {
+                keypress
+                    .handle_keymatch(
+                        self,
+                        handle.keymatch.clone(),
+                        handle.keypress.clone(),
+                    )
+                    .handled
+            }
+        } else {
+            keypress.key_down(event, self).handled
         }
-
-        keypress.key_down(event, self)
     }
 
     pub fn workspace_info(&self) -> WorkspaceInfo {
@@ -2210,7 +2631,11 @@ impl WindowTabData {
             PanelKind::FileExplorer
             | PanelKind::Plugin
             | PanelKind::Problem
-            | PanelKind::Debug => {
+            | PanelKind::Debug
+            | PanelKind::CallHierarchy
+            | PanelKind::DocumentSymbol
+            | PanelKind::References
+            | PanelKind::Implementation => {
                 // Some panels don't accept focus (yet). Fall back to visibility check
                 // in those cases.
                 self.panel.is_panel_visible(&kind)
@@ -2282,7 +2707,13 @@ impl WindowTabData {
                 .tab_info
                 .with_untracked(|info| info.tabs.is_empty())
         {
-            self.terminal.new_tab(None);
+            self.terminal.new_tab(
+                self.common
+                    .config
+                    .get_untracked()
+                    .terminal
+                    .get_default_profile(),
+            );
         }
         self.panel.show_panel(&kind);
         if kind == PanelKind::Search
@@ -2305,6 +2736,7 @@ impl WindowTabData {
         mode: &RunDebugMode,
         config: &RunDebugConfig,
     ) {
+        debug!("{:?}", config);
         match mode {
             RunDebugMode::Run => {
                 self.run_in_terminal(cx, mode, config, false);
@@ -2318,6 +2750,9 @@ impl WindowTabData {
                         self.terminal.debug.source_breakpoints(),
                     )
                 };
+                if !self.panel.is_panel_visible(&PanelKind::Debug) {
+                    self.panel.show_panel(&PanelKind::Debug);
+                }
             }
         }
     }
@@ -2438,7 +2873,7 @@ impl WindowTabData {
                 lsp_types::WorkDoneProgress::Report(report) => {
                     self.progresses.update(|p| {
                         if let Some(progress) = p.get_mut(&token) {
-                            progress.message = report.message.clone();
+                            progress.message.clone_from(&report.message);
                             progress.percentage = report.percentage;
                         }
                     })
@@ -2456,6 +2891,93 @@ impl WindowTabData {
         self.messages.update(|messages| {
             messages.push((title.to_string(), message.clone()));
         });
+    }
+
+    pub fn update_code_lens_id(&self, view_id: Option<ViewId>) {
+        if let Some(Some(old_id)) = self.code_lens.try_update(|x| {
+            let old = x.take();
+            if let Some(id) = view_id {
+                let _ = x.insert(id);
+            }
+            old
+        }) {
+            remove_overlay(old_id);
+        }
+    }
+
+    pub fn show_code_lens(
+        &self,
+        mouse_click: bool,
+        plugin_id: PluginId,
+        offset: usize,
+        lens: im::Vector<CodeLens>,
+    ) {
+        self.common
+            .internal_command
+            .send(InternalCommand::ShowCodeActions {
+                offset,
+                mouse_click,
+                plugin_id,
+                code_actions: lens
+                    .into_iter()
+                    .filter_map(|lens| {
+                        Some(CodeActionOrCommand::Command(lens.command?))
+                    })
+                    .collect(),
+            });
+    }
+
+    pub fn call_hierarchy_incoming(&self, item_id: ViewId) {
+        let Some(root) = self.call_hierarchy_data.root.get_untracked() else {
+            return;
+        };
+        let Some(item) = CallHierarchyItemData::find_by_id(root, item_id) else {
+            return;
+        };
+        let root_item = item;
+        let path: PathBuf = item.get_untracked().item.uri.to_file_path().unwrap();
+        let scope = self.scope;
+        let send =
+            create_ext_action(scope, move |_rs: Result<ProxyResponse, RpcError>| {
+                match _rs {
+                    Ok(ProxyResponse::CallHierarchyIncomingResponse { items }) => {
+                        if let Some(items) = items {
+                            let mut item_children = Vec::new();
+                            for x in items {
+                                let item = Rc::new(x.from);
+                                for range in x.from_ranges {
+                                    item_children.push(scope.create_rw_signal(
+                                        CallHierarchyItemData {
+                                            view_id: floem::ViewId::new(),
+                                            item: item.clone(),
+                                            from_range: range,
+                                            init: false,
+                                            open: scope.create_rw_signal(false),
+                                            children:
+                                                scope.create_rw_signal(Vec::new()),
+                                        },
+                                    ))
+                                }
+                            }
+                            root_item.update(|x| {
+                                x.init = true;
+                                x.children.update(|children| {
+                                    *children = item_children;
+                                })
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("{:?}", err);
+                    }
+                    Ok(_) => {}
+                }
+            });
+        self.common.proxy.call_hierarchy_incoming(
+            path,
+            item.get_untracked().item.as_ref().clone(),
+            send,
+        );
     }
 }
 

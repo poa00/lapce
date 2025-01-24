@@ -5,17 +5,22 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::{atomic, Arc},
+    sync::{
+        atomic::{self, AtomicUsize},
+        Arc,
+    },
     time::Duration,
 };
 
 use floem::{
     action::exec_after,
-    cosmic_text::{Attrs, AttrsList, FamilyOwned, TextLayout},
     ext_event::create_ext_action,
     keyboard::Modifiers,
     peniko::Color,
-    reactive::{batch, ReadSignal, RwSignal, Scope},
+    reactive::{
+        batch, ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate, SignalWith,
+    },
+    text::{Attrs, AttrsList, FamilyOwned, TextLayout},
     views::editor::{
         actions::CommonAction,
         command::{Command, CommandExecuted},
@@ -26,6 +31,7 @@ use floem::{
         view::{ScreenLines, ScreenLinesBase},
         CursorInfo, Editor, EditorStyle,
     },
+    ViewId,
 };
 use itertools::Itertools;
 use lapce_core::{
@@ -36,7 +42,7 @@ use lapce_core::{
     },
     char_buffer::CharBuffer,
     command::EditCommand,
-    cursor::Cursor,
+    cursor::{Cursor, CursorAffinity},
     editor::{Action, EditConf, EditType},
     indent::IndentStyle,
     language::LapceLanguage,
@@ -47,7 +53,7 @@ use lapce_core::{
     selection::{InsertDrift, Selection},
     style::line_styles,
     syntax::{edit::SyntaxEdit, BracketParser, Syntax},
-    word::WordCursor,
+    word::{get_char_property, CharClassification, WordCursor},
 };
 use lapce_rpc::{
     buffer::BufferId,
@@ -60,20 +66,29 @@ use lapce_xi_rope::{
     Interval, Rope, RopeDelta, Transformer,
 };
 use lsp_types::{
-    CodeActionResponse, Diagnostic, DiagnosticSeverity, InlayHint, InlayHintLabel,
+    CodeActionOrCommand, CodeLens, Diagnostic, DiagnosticSeverity,
+    DocumentSymbolResponse, InlayHint, InlayHintLabel, TextEdit,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::{
-    command::{CommandKind, LapceCommand},
+    command::{CommandKind, InternalCommand, LapceCommand},
     config::{color::LapceColor, LapceConfig},
-    editor::{compute_screen_lines, EditorData},
+    editor::{
+        compute_screen_lines,
+        gutter::FoldingRanges,
+        location::{EditorLocation, EditorPosition},
+        EditorData,
+    },
     find::{Find, FindProgress, FindResult},
     history::DocumentHistory,
     keypress::KeyPressFocus,
     main_split::Editors,
-    panel::kind::PanelKind,
+    panel::{
+        document_symbol::{SymbolData, SymbolInformationItemData},
+        kind::PanelKind,
+    },
     window_tab::{CommonData, Focus},
     workspace::LapceWorkspace,
 };
@@ -81,12 +96,13 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct DiagnosticData {
     pub expanded: RwSignal<bool>,
-    pub diagnostics: RwSignal<im::Vector<EditorDiagnostic>>,
+    pub diagnostics: RwSignal<im::Vector<Diagnostic>>,
+    pub diagnostics_span: RwSignal<Spans<Diagnostic>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditorDiagnostic {
-    pub range: (usize, usize),
+    pub range: Option<(usize, usize)>,
     pub diagnostic: Diagnostic,
 }
 
@@ -145,7 +161,10 @@ pub struct DocInfo {
 }
 
 /// (Offset -> (Plugin the code actions are from, Code Actions))
-pub type CodeActions = im::HashMap<usize, Arc<(PluginId, CodeActionResponse)>>;
+pub type CodeActions =
+    im::HashMap<usize, (PluginId, im::Vector<CodeActionOrCommand>)>;
+
+pub type AllCodeLens = im::HashMap<usize, (PluginId, usize, im::Vector<CodeLens>)>;
 
 #[derive(Clone)]
 pub struct Doc {
@@ -166,7 +185,7 @@ pub struct Doc {
     /// (line, col)
     pub completion_pos: RwSignal<(usize, usize)>,
 
-    /// Current inline completion text, if any.  
+    /// Current inline completion text, if any.
     /// This will be displayed even on views that are not focused.
     pub inline_completion: RwSignal<Option<String>>,
     /// (line, col)
@@ -174,6 +193,10 @@ pub struct Doc {
 
     /// (Offset -> (Plugin the code actions are from, Code Actions))
     pub code_actions: RwSignal<CodeActions>,
+
+    pub code_lens: RwSignal<AllCodeLens>,
+
+    pub folding_ranges: RwSignal<FoldingRanges>,
 
     /// Stores information about different versions of the document from source control.
     histories: RwSignal<im::HashMap<String, DocumentHistory>>,
@@ -194,6 +217,8 @@ pub struct Doc {
 
     editors: Editors,
     pub common: Rc<CommonData>,
+
+    pub document_symbol_data: RwSignal<Option<SymbolData>>,
 }
 impl Doc {
     pub fn new(
@@ -237,6 +262,9 @@ impl Doc {
             preedit: PreeditData::new(cx),
             editors,
             common,
+            code_lens: cx.create_rw_signal(im::HashMap::new()),
+            document_symbol_data: cx.create_rw_signal(None),
+            folding_ranges: cx.create_rw_signal(FoldingRanges::default()),
         }
     }
 
@@ -268,6 +296,7 @@ impl Doc {
             diagnostics: DiagnosticData {
                 expanded: cx.create_rw_signal(true),
                 diagnostics: cx.create_rw_signal(im::Vector::new()),
+                diagnostics_span: cx.create_rw_signal(SpansBuilder::new(0).build()),
             },
             completion_lens: cx.create_rw_signal(None),
             completion_pos: cx.create_rw_signal((0, 0)),
@@ -284,6 +313,9 @@ impl Doc {
             preedit: PreeditData::new(cx),
             editors,
             common,
+            code_lens: cx.create_rw_signal(im::HashMap::new()),
+            document_symbol_data: cx.create_rw_signal(None),
+            folding_ranges: cx.create_rw_signal(FoldingRanges::default()),
         }
     }
 
@@ -315,6 +347,7 @@ impl Doc {
             diagnostics: DiagnosticData {
                 expanded: cx.create_rw_signal(true),
                 diagnostics: cx.create_rw_signal(im::Vector::new()),
+                diagnostics_span: cx.create_rw_signal(SpansBuilder::new(0).build()),
             },
             completion_lens: cx.create_rw_signal(None),
             completion_pos: cx.create_rw_signal((0, 0)),
@@ -331,6 +364,9 @@ impl Doc {
             preedit: PreeditData::new(cx),
             editors,
             common,
+            code_lens: cx.create_rw_signal(im::HashMap::new()),
+            document_symbol_data: cx.create_rw_signal(None),
+            folding_ranges: cx.create_rw_signal(FoldingRanges::default()),
         }
     }
 
@@ -433,7 +469,7 @@ impl Doc {
                 self.parser.borrow_mut().update_code(
                     code,
                     &self.buffer.get_untracked(),
-                    Some(syntax.clone()),
+                    Some(syntax),
                 );
             } else {
                 self.parser.borrow_mut().update_code(
@@ -558,9 +594,9 @@ impl Doc {
                 buffer.set_cursor_before(old_cursor);
                 buffer.set_cursor_after(cursor.mode.clone());
             });
+            self.apply_deltas(&deltas);
         }
 
-        self.apply_deltas(&deltas);
         deltas
     }
 
@@ -593,7 +629,7 @@ impl Doc {
                 SyntaxEdit::from_delta(before_text, delta.clone())
             })
             .collect();
-        self.on_update(Some(edits.as_slice()));
+        self.on_update(Some(edits));
     }
 
     pub fn is_pristine(&self) -> bool {
@@ -605,54 +641,79 @@ impl Doc {
         self.buffer.with_untracked(|b| b.rev())
     }
 
-    /// Get the buffer's line-ending.  
+    /// Get the buffer's line-ending.
     /// Note: this may not be the same as what the actual line endings in the file are, rather this
     /// is what the line-ending is set to (and what it will be saved as).
     pub fn line_ending(&self) -> LineEnding {
         self.buffer.with_untracked(|b| b.line_ending())
     }
 
-    fn on_update(&self, edits: Option<&[SyntaxEdit]>) {
+    fn on_update(&self, edits: Option<SmallVec<[SyntaxEdit; 3]>>) {
         batch(|| {
-            self.clear_code_actions();
-            self.clear_style_cache();
             self.trigger_syntax_change(edits);
-            self.clear_sticky_headers_cache();
             self.trigger_head_change();
             self.check_auto_save();
-            self.get_semantic_styles();
             self.get_inlay_hints();
             self.find_result.reset();
+            self.get_semantic_styles();
             self.do_bracket_colorization();
+            self.clear_code_actions();
+            self.clear_style_cache();
+            self.get_code_lens();
+            self.get_document_symbol();
+            self.get_folding_range();
         });
     }
 
     fn do_bracket_colorization(&self) {
-        self.syntax.with_untracked(|syntax| {
-            if syntax.styles.is_some() {
-                self.parser.borrow_mut().update_code(
-                    self.buffer.get_untracked().to_string(),
-                    &self.buffer.get_untracked(),
-                    Some(syntax.clone()),
-                );
-            } else {
-                self.parser.borrow_mut().update_code(
-                    self.buffer.get_untracked().to_string(),
-                    &self.buffer.get_untracked(),
-                    None,
-                );
-            }
-        })
+        if self.parser.borrow().active {
+            self.syntax.with_untracked(|syntax| {
+                if syntax.rev == self.rev() && syntax.styles.is_some() {
+                    self.parser.borrow_mut().update_code(
+                        self.buffer.get_untracked().to_string(),
+                        &self.buffer.get_untracked(),
+                        Some(syntax),
+                    );
+                } else {
+                    self.parser.borrow_mut().update_code(
+                        self.buffer.get_untracked().to_string(),
+                        &self.buffer.get_untracked(),
+                        None,
+                    );
+                }
+            })
+        }
+    }
+
+    pub fn do_text_edit(&self, edits: &[TextEdit]) {
+        let edits = self.buffer.with_untracked(|buffer| {
+            let edits = edits
+                .iter()
+                .map(|edit| {
+                    let selection = lapce_core::selection::Selection::region(
+                        buffer.offset_of_position(&edit.range.start),
+                        buffer.offset_of_position(&edit.range.end),
+                    );
+                    (selection, edit.new_text.as_str())
+                })
+                .collect::<Vec<_>>();
+            edits
+        });
+        self.do_raw_edit(&edits, EditType::Completion);
     }
 
     fn check_auto_save(&self) {
         let config = self.common.config.get_untracked();
         if config.editor.autosave_interval > 0 {
-            if !self.content.with_untracked(|c| c.is_file()) {
+            let Some(path) = self.content.with_untracked(|c| c.path().cloned())
+            else {
                 return;
             };
             let rev = self.rev();
             let doc = self.clone();
+            let scope = self.scope;
+            let proxy = self.common.proxy.clone();
+            let format = config.editor.format_on_save;
             exec_after(
                 Duration::from_millis(config.editor.autosave_interval),
                 move |_| {
@@ -668,7 +729,26 @@ impl Doc {
                         return;
                     }
 
-                    doc.save(|| {});
+                    if format {
+                        let send = create_ext_action(scope, move |result| {
+                            let current_rev = doc.rev();
+                            if current_rev != rev {
+                                return;
+                            }
+                            if let Ok(ProxyResponse::GetDocumentFormatting {
+                                edits,
+                            }) = result
+                            {
+                                doc.do_text_edit(&edits);
+                            }
+                            doc.save(|| {});
+                        });
+                        proxy.get_document_formatting(path, move |result| {
+                            send(result);
+                        });
+                    } else {
+                        doc.save(|| {});
+                    }
                 },
             );
         }
@@ -701,12 +781,28 @@ impl Doc {
         });
     }
 
-    pub fn trigger_syntax_change(&self, edits: Option<&[SyntaxEdit]>) {
+    pub fn trigger_syntax_change(&self, edits: Option<SmallVec<[SyntaxEdit; 3]>>) {
         let (rev, text) =
             self.buffer.with_untracked(|b| (b.rev(), b.text().clone()));
 
+        let doc = self.clone();
+        let send = create_ext_action(self.scope, move |syntax| {
+            if doc.buffer.with_untracked(|b| b.rev()) == rev {
+                doc.syntax.set(syntax);
+                doc.do_bracket_colorization();
+                doc.clear_style_cache();
+                doc.clear_sticky_headers_cache();
+            }
+        });
+
         self.syntax.update(|syntax| {
-            syntax.parse(rev, text, edits);
+            syntax.cancel_flag.store(1, atomic::Ordering::Relaxed);
+            syntax.cancel_flag = Arc::new(AtomicUsize::new(0));
+        });
+        let mut syntax = self.syntax.get_untracked();
+        rayon::spawn(move || {
+            syntax.parse(rev, text, edits.as_deref());
+            send(syntax);
         });
     }
 
@@ -768,7 +864,7 @@ impl Doc {
     }
 
     /// Request semantic styles for the buffer from the LSP through the proxy.
-    fn get_semantic_styles(&self) {
+    pub fn get_semantic_styles(&self) {
         if !self.loaded() {
             return;
         }
@@ -780,24 +876,37 @@ impl Doc {
                 return;
             };
 
-        let (rev, len) = self.buffer.with_untracked(|b| (b.rev(), b.len()));
-
-        let syntactic_styles =
-            self.syntax.with_untracked(|syntax| syntax.styles.clone());
+        let (atomic_rev, rev, len) = self
+            .buffer
+            .with_untracked(|b| (b.atomic_rev(), b.rev(), b.len()));
 
         let doc = self.clone();
         let send = create_ext_action(self.scope, move |styles| {
-            if doc.buffer.with_untracked(|b| b.rev()) == rev {
-                doc.semantic_styles.set(Some(styles));
-                doc.clear_style_cache();
+            if let Some(styles) = styles {
+                if doc.buffer.with_untracked(|b| b.rev()) == rev {
+                    doc.semantic_styles.set(Some(styles));
+                    doc.clear_style_cache();
+                }
             }
         });
 
         self.common.proxy.get_semantic_tokens(path, move |result| {
             if let Ok(ProxyResponse::GetSemanticTokens { styles }) = result {
-                rayon::spawn(move || {
+                if styles.styles.is_empty() {
+                    send(None);
+                    return;
+                }
+                if atomic_rev.load(atomic::Ordering::Acquire) != rev {
+                    send(None);
+                    return;
+                }
+                std::thread::spawn(move || {
                     let mut styles_span = SpansBuilder::new(len);
                     for style in styles.styles {
+                        if atomic_rev.load(atomic::Ordering::Acquire) != rev {
+                            send(None);
+                            return;
+                        }
                         styles_span.add_span(
                             Interval::new(style.start, style.end),
                             style.style,
@@ -805,26 +914,103 @@ impl Doc {
                     }
 
                     let styles = styles_span.build();
-
-                    let styles = if let Some(syntactic_styles) = syntactic_styles {
-                        syntactic_styles.merge(&styles, |a, b| {
-                            if let Some(b) = b {
-                                return b.clone();
-                            }
-                            a.clone()
-                        })
-                    } else {
-                        styles
-                    };
-
-                    send(styles);
+                    send(Some(styles));
                 });
+            } else {
+                send(None);
             }
         });
     }
 
+    pub fn get_code_lens(&self) {
+        let cx = self.scope;
+        let doc = self.clone();
+        self.code_lens.update(|code_lens| {
+            code_lens.clear();
+        });
+        let rev = self.rev();
+        if let DocContent::File { path, .. } = doc.content.get_untracked() {
+            let send = create_ext_action(cx, move |result| {
+                if rev != doc.rev() {
+                    return;
+                }
+                if let Ok(ProxyResponse::GetCodeLensResponse { plugin_id, resp }) =
+                    result
+                {
+                    let Some(codelens) = resp else {
+                        return;
+                    };
+                    doc.code_lens.update(|code_lens| {
+                        for codelens in codelens {
+                            if codelens.command.is_none() {
+                                continue;
+                            }
+                            let entry = code_lens
+                                .entry(codelens.range.start.line as usize)
+                                .or_insert_with(|| {
+                                    (
+                                        plugin_id,
+                                        doc.buffer.with_untracked(|b| {
+                                            b.offset_of_line(
+                                                codelens.range.start.line as usize,
+                                            )
+                                        }),
+                                        im::Vector::new(),
+                                    )
+                                });
+                            entry.2.push_back(codelens);
+                        }
+                    });
+                }
+            });
+            self.common.proxy.get_code_lens(path, move |result| {
+                send(result);
+            });
+        }
+    }
+
+    pub fn get_document_symbol(&self) {
+        let cx = self.scope;
+        let doc = self.clone();
+        let rev = self.rev();
+        if let DocContent::File { path, .. } = doc.content.get_untracked() {
+            let send = create_ext_action(cx, {
+                let path = path.clone();
+                move |result| {
+                    if rev != doc.rev() {
+                        return;
+                    }
+                    if let Ok(ProxyResponse::GetDocumentSymbols { resp }) = result {
+                        let items: Vec<RwSignal<SymbolInformationItemData>> =
+                            match resp {
+                                DocumentSymbolResponse::Flat(_symbols) => {
+                                    Vec::with_capacity(0)
+                                }
+                                DocumentSymbolResponse::Nested(symbols) => symbols
+                                    .into_iter()
+                                    .map(|x| {
+                                        cx.create_rw_signal(
+                                            SymbolInformationItemData::from((x, cx)),
+                                        )
+                                    })
+                                    .collect(),
+                            };
+                        let symbol_new = Some(SymbolData::new(items, path, cx));
+                        doc.document_symbol_data.update(|symbol| {
+                            *symbol = symbol_new;
+                        });
+                    }
+                }
+            });
+
+            self.common.proxy.get_document_symbols(path, move |result| {
+                send(result);
+            });
+        }
+    }
+
     /// Request inlay hints for the buffer from the LSP through the proxy.
-    fn get_inlay_hints(&self) {
+    pub fn get_inlay_hints(&self) {
         if !self.loaded() {
             return;
         }
@@ -882,87 +1068,67 @@ impl Doc {
         {
             return;
         }
-        self.diagnostics.diagnostics.update(|diagnostics| {
-            for diagnostic in diagnostics.iter_mut() {
-                let mut transformer = Transformer::new(delta);
-                let (start, end) = diagnostic.range;
-                let (new_start, new_end) = (
-                    transformer.transform(start, false),
-                    transformer.transform(end, true),
-                );
 
-                let (new_start_pos, new_end_pos) = self.buffer.with_untracked(|b| {
-                    (
-                        b.offset_to_position(new_start),
-                        b.offset_to_position(new_end),
-                    )
-                });
-
-                diagnostic.range = (new_start, new_end);
-
-                diagnostic.diagnostic.range.start = new_start_pos;
-                diagnostic.diagnostic.range.end = new_end_pos;
-            }
+        self.diagnostics.diagnostics_span.update(|diagnostics| {
+            diagnostics.apply_shape(delta);
         });
     }
 
     /// init diagnostics offset ranges from lsp positions
     pub fn init_diagnostics(&self) {
+        let len = self.buffer.with_untracked(|b| b.len());
+        let diagnostics = self.diagnostics.diagnostics.get_untracked();
+
+        let span = self.buffer.with_untracked(|buffer| {
+            let mut span = SpansBuilder::new(len);
+            for diag in diagnostics.iter() {
+                let start = buffer.offset_of_position(&diag.range.start);
+                let end = buffer.offset_of_position(&diag.range.end);
+                span.add_span(Interval::new(start, end), diag.to_owned());
+            }
+            span.build()
+        });
+        self.diagnostics.diagnostics_span.set(span);
+
         self.clear_text_cache();
         self.clear_code_actions();
-        self.diagnostics.diagnostics.update(|diagnostics| {
-            for diagnostic in diagnostics.iter_mut() {
-                let (start, end) = self.buffer.with_untracked(|buffer| {
-                    (
-                        buffer
-                            .offset_of_position(&diagnostic.diagnostic.range.start),
-                        buffer.offset_of_position(&diagnostic.diagnostic.range.end),
-                    )
-                });
-                diagnostic.range = (start, end);
-            }
-        });
     }
 
-    /// Iterate over the editor diagnostics on a line
-    fn iter_diagnostics(
-        &self,
-        line: usize,
-    ) -> impl Iterator<Item = EditorDiagnostic> + '_ {
-        self.common
-            .config
-            .get_untracked()
-            .editor
-            .enable_completion_lens
-            .then_some(())
-            .map(|_| self.diagnostics.diagnostics.get_untracked())
-            .into_iter()
-            .flatten()
-            .filter(move |diag| {
-                diag.diagnostic.range.end.line as usize == line
-                    && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
-            })
-    }
+    pub fn get_folding_range(&self) {
+        // let cx = self.scope;
+        // let doc = self.clone();
+        // let rev = self.rev();
+        // if let DocContent::File { path, .. } = doc.content.get_untracked() {
+        //     let send = create_ext_action(cx, {
+        //         move |result| {
+        //             if rev != doc.rev() {
+        //                 return;
+        //             }
+        //             if let Ok(ProxyResponse::LspFoldingRangeResponse {
+        //                 resp, ..
+        //             }) = result
+        //             {
+        //                 let folding = resp
+        //                     .unwrap_or_default()
+        //                     .into_iter()
+        //                     .map(|x| {
+        //                         crate::editor::gutter::FoldingRange::from_lsp(x)
+        //                     })
+        //                     .sorted_by(|x, y| x.start.line.cmp(&y.start.line))
+        //                     .collect();
+        //                 doc.folding_ranges.update(|symbol| {
+        //                     symbol.0 = folding;
+        //                 });
+        //             }
+        //         }
+        //     });
 
-    /// Get the max severity of the diagnostics o na line.  
-    /// This is used to determine the color given to the background of the line
-    fn max_diag_severity(&self, line: usize) -> Option<DiagnosticSeverity> {
-        let mut max_severity = None;
-        for diag in self.iter_diagnostics(line) {
-            match (diag.diagnostic.severity, max_severity) {
-                (Some(severity), Some(max)) => {
-                    if severity < max {
-                        max_severity = Some(severity);
-                    }
-                }
-                (Some(severity), None) => {
-                    max_severity = Some(severity);
-                }
-                _ => {}
-            }
-        }
-
-        max_severity
+        //     self.common
+        //         .proxy
+        //         .get_lsp_folding_range(path, move |result| {
+        //             send(result);
+        //         });
+        // }
     }
 
     /// Get the current completion lens text
@@ -977,16 +1143,16 @@ impl Doc {
         col: usize,
     ) {
         // TODO: more granular invalidation
-        self.clear_text_cache();
         self.completion_lens.set(Some(completion_lens));
         self.completion_pos.set((line, col));
+        self.clear_text_cache();
     }
 
     pub fn clear_completion_lens(&self) {
         // TODO: more granular invalidation
         if self.completion_lens.get_untracked().is_some() {
-            self.clear_text_cache();
             self.completion_lens.set(None);
+            self.clear_text_cache();
         }
     }
 
@@ -1105,7 +1271,35 @@ impl Doc {
             .set(FindProgress::InProgress(Selection::new()));
 
         let find_result = self.find_result.clone();
-        let send = create_ext_action(self.scope, move |occurrences| {
+        let find_rev_signal = self.common.find.rev;
+        let triggered_by_changes = self.common.find.triggered_by_changes;
+
+        let path = self.content.get_untracked().path().cloned();
+        let common = self.common.clone();
+        let send = create_ext_action(self.scope, move |occurrences: Selection| {
+            #[allow(clippy::single_match)]
+            match (
+                occurrences.regions().is_empty(),
+                &path,
+                find_rev_signal.get_untracked() == find_rev,
+                triggered_by_changes.get_untracked(),
+            ) {
+                (false, Some(path), true, true) => {
+                    triggered_by_changes.set(false);
+                    common.internal_command.send(InternalCommand::GoToLocation {
+                        location: EditorLocation {
+                            path: path.clone(),
+                            position: Some(EditorPosition::Offset(
+                                occurrences.regions()[0].start,
+                            )),
+                            scroll_offset: None,
+                            ignore_unconfirmed: false,
+                            same_editor_tab: false,
+                        },
+                    });
+                }
+                _ => {}
+            }
             find_result.occurrences.set(occurrences);
             find_result.progress.set(FindProgress::Ready);
         });
@@ -1273,9 +1467,9 @@ impl Doc {
     ) {
         // TODO: more granular invalidation
         batch(|| {
-            self.clear_text_cache();
             self.inline_completion.set(Some(inline_completion));
             self.inline_completion_pos.set((line, col));
+            self.clear_text_cache();
         });
     }
 
@@ -1335,9 +1529,11 @@ impl Doc {
     /// Uses a language aware algorithm if syntax support is available for the current language,
     /// else falls back to a language unaware algorithm.
     pub fn find_enclosing_brackets(&self, offset: usize) -> Option<(usize, usize)> {
+        let rev = self.rev();
         self.syntax
             .with_untracked(|syntax| {
-                (!syntax.text.is_empty()).then(|| syntax.find_enclosing_pair(offset))
+                (!syntax.text.is_empty() && syntax.rev == rev)
+                    .then(|| syntax.find_enclosing_pair(offset))
             })
             // If syntax.text is empty, either the buffer is empty or we don't have syntax support
             // for the current language.
@@ -1459,6 +1655,7 @@ impl Document for Doc {
         self.apply_deltas(&[delta]);
     }
 }
+
 impl DocumentPhantom for Doc {
     fn phantom_text(
         &self,
@@ -1487,9 +1684,46 @@ impl DocumentPhantom for Doc {
                 interval.start >= start_offset && interval.start < end_offset
             })
             .map(|(interval, inlay_hint)| {
-                let (_, col) = self
-                    .buffer
-                    .with_untracked(|b| b.offset_to_line_col(interval.start));
+                let (col, affinity) = self.buffer.with_untracked(|b| {
+                    let mut cursor =
+                        lapce_xi_rope::Cursor::new(b.text(), interval.start);
+
+                    let next_char = cursor.peek_next_codepoint();
+                    let prev_char = cursor.prev_codepoint();
+
+                    let mut affinity = None;
+                    if let Some(prev_char) = prev_char {
+                        let c = get_char_property(prev_char);
+                        if c == CharClassification::Other {
+                            affinity = Some(CursorAffinity::Backward)
+                        } else if matches!(
+                            c,
+                            CharClassification::Lf
+                                | CharClassification::Cr
+                                | CharClassification::Space
+                        ) {
+                            affinity = Some(CursorAffinity::Forward)
+                        }
+                    };
+                    if affinity.is_none() {
+                        if let Some(next_char) = next_char {
+                            let c = get_char_property(next_char);
+                            if c == CharClassification::Other {
+                                affinity = Some(CursorAffinity::Forward)
+                            } else if matches!(
+                                c,
+                                CharClassification::Lf
+                                    | CharClassification::Cr
+                                    | CharClassification::Space
+                            ) {
+                                affinity = Some(CursorAffinity::Backward)
+                            }
+                        }
+                    }
+
+                    let (_, col) = b.offset_to_line_col(interval.start);
+                    (col, affinity)
+                });
                 let text = match &inlay_hint.label {
                     InlayHintLabel::String(label) => label.to_string(),
                     InlayHintLabel::LabelParts(parts) => {
@@ -1500,6 +1734,7 @@ impl DocumentPhantom for Doc {
                     kind: PhantomTextKind::InlayHint,
                     col,
                     text,
+                    affinity,
                     fg: Some(config.color(LapceColor::INLAY_HINT_FOREGROUND)),
                     // font_family: Some(config.editor.inlay_hint_font_family()),
                     font_size: Some(config.editor.inlay_hint_font_size()),
@@ -1515,55 +1750,75 @@ impl DocumentPhantom for Doc {
         // If error lens is enabled, and the diagnostics field is filled, then get the diagnostics
         // that end on this line which have a severity worse than HINT and convert them into
         // PhantomText instances
-        let diag_text = config
-            .editor
-            .enable_error_lens
-            .then_some(())
-            .map(|_| self.diagnostics.diagnostics.get_untracked())
-            .into_iter()
-            .flatten()
-            .filter(|diag| {
-                diag.diagnostic.range.end.line as usize == line
-                    && diag.diagnostic.severity < Some(DiagnosticSeverity::HINT)
-            })
-            .map(|diag| {
-                let col = self.buffer.with_untracked(|buffer| {
-                    buffer.offset_of_line(line + 1) - buffer.offset_of_line(line)
-                });
-                let fg = {
-                    let severity = diag
-                        .diagnostic
-                        .severity
-                        .unwrap_or(DiagnosticSeverity::WARNING);
-                    let theme_prop = if severity == DiagnosticSeverity::ERROR {
-                        LapceColor::ERROR_LENS_ERROR_FOREGROUND
-                    } else if severity == DiagnosticSeverity::WARNING {
-                        LapceColor::ERROR_LENS_WARNING_FOREGROUND
-                    } else {
-                        // information + hint (if we keep that) + things without a severity
-                        LapceColor::ERROR_LENS_OTHER_FOREGROUND
-                    };
 
-                    config.color(theme_prop)
-                };
+        let mut diag_text: SmallVec<[PhantomText; 6]> =
+            self.buffer.with_untracked(|buffer| {
+                config
+                    .editor
+                    .enable_error_lens
+                    .then_some(())
+                    .map(|_| self.diagnostics.diagnostics_span.get_untracked())
+                    .map(|diags| {
+                        diags
+                            .iter_chunks(start_offset..end_offset)
+                            .filter_map(|(iv, diag)| {
+                                let end = iv.end();
+                                let end_line = buffer.line_of_offset(end);
+                                if end_line == line
+                                    && diag.severity < Some(DiagnosticSeverity::HINT)
+                                {
+                                    let fg = {
+                                        let severity = diag
+                                            .severity
+                                            .unwrap_or(DiagnosticSeverity::WARNING);
+                                        let theme_prop = if severity
+                                            == DiagnosticSeverity::ERROR
+                                        {
+                                            LapceColor::ERROR_LENS_ERROR_FOREGROUND
+                                        } else if severity
+                                            == DiagnosticSeverity::WARNING
+                                        {
+                                            LapceColor::ERROR_LENS_WARNING_FOREGROUND
+                                        } else {
+                                            // information + hint (if we keep that) + things without a severity
+                                            LapceColor::ERROR_LENS_OTHER_FOREGROUND
+                                        };
 
-                let text = if config.editor.error_lens_multiline {
-                    format!("    {}", diag.diagnostic.message)
-                } else {
-                    format!("    {}", diag.diagnostic.message.lines().join(" "))
-                };
-                PhantomText {
-                    kind: PhantomTextKind::Diagnostic,
-                    col,
-                    text,
-                    fg: Some(fg),
-                    font_size: Some(config.editor.error_lens_font_size()),
-                    // font_family: Some(config.editor.error_lens_font_family()),
-                    bg: None,
-                    under_line: None,
-                }
+                                        config.color(theme_prop)
+                                    };
+
+                                    let text =
+                                        if config.editor.only_render_error_styling {
+                                            "".to_string()
+                                        } else if config.editor.error_lens_multiline
+                                        {
+                                            format!("    {}", diag.message)
+                                        } else {
+                                            format!(
+                                                "    {}",
+                                                diag.message.lines().join(" ")
+                                            )
+                                        };
+                                    Some(PhantomText {
+                                        kind: PhantomTextKind::Diagnostic,
+                                        col: end_offset - start_offset,
+                                        affinity: Some(CursorAffinity::Backward),
+                                        text,
+                                        fg: Some(fg),
+                                        font_size: Some(
+                                            config.editor.error_lens_font_size(),
+                                        ),
+                                        bg: None,
+                                        under_line: None,
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<SmallVec<[PhantomText; 6]>>()
+                    })
+                    .unwrap_or_default()
             });
-        let mut diag_text: SmallVec<[PhantomText; 6]> = diag_text.collect();
 
         text.append(&mut diag_text);
 
@@ -1581,6 +1836,7 @@ impl DocumentPhantom for Doc {
                 text: completion.clone(),
                 fg: Some(config.color(LapceColor::COMPLETION_LENS_FOREGROUND)),
                 font_size: Some(config.editor.completion_lens_font_size()),
+                affinity: Some(CursorAffinity::Backward),
                 // font_family: Some(config.editor.completion_lens_font_family()),
                 bg: None,
                 under_line: None,
@@ -1605,6 +1861,7 @@ impl DocumentPhantom for Doc {
                 kind: PhantomTextKind::Completion,
                 col: inline_completion_col,
                 text: completion.clone(),
+                affinity: Some(CursorAffinity::Backward),
                 fg: Some(config.color(LapceColor::COMPLETION_LENS_FOREGROUND)),
                 font_size: Some(config.editor.completion_lens_font_size()),
                 // font_family: Some(config.editor.completion_lens_font_family()),
@@ -1727,23 +1984,23 @@ impl Styling for DocStyling {
         &self,
         _: EditorId,
         _line: usize,
-    ) -> std::borrow::Cow<[floem::cosmic_text::FamilyOwned]> {
+    ) -> std::borrow::Cow<[floem::text::FamilyOwned]> {
         // TODO: cache this
         Cow::Owned(self.config.with_untracked(|config| {
             FamilyOwned::parse_list(&config.editor.font_family).collect()
         }))
     }
 
-    fn weight(&self, _: EditorId, _line: usize) -> floem::cosmic_text::Weight {
-        floem::cosmic_text::Weight::NORMAL
+    fn weight(&self, _: EditorId, _line: usize) -> floem::text::Weight {
+        floem::text::Weight::NORMAL
     }
 
-    fn italic_style(&self, _: EditorId, _line: usize) -> floem::cosmic_text::Style {
-        floem::cosmic_text::Style::Normal
+    fn italic_style(&self, _: EditorId, _line: usize) -> floem::text::Style {
+        floem::text::Style::Normal
     }
 
-    fn stretch(&self, _: EditorId, _line: usize) -> floem::cosmic_text::Stretch {
-        floem::cosmic_text::Stretch::Normal
+    fn stretch(&self, _: EditorId, _line: usize) -> floem::text::Stretch {
+        floem::text::Stretch::Normal
     }
 
     fn indent_line(&self, _: EditorId, line: usize, line_content: &str) -> usize {
@@ -1826,8 +2083,61 @@ impl Styling for DocStyling {
             });
         layout_line.extra_style.extend(phantom_styles);
 
+        let (start_offset, end_offset) = doc.buffer.with_untracked(|buffer| {
+            (buffer.offset_of_line(line), buffer.offset_of_line(line + 1))
+        });
+
+        let mut max_severity: Option<DiagnosticSeverity> = None;
+        doc.diagnostics.diagnostics_span.with_untracked(|diags| {
+            diags
+                .iter_chunks(start_offset..end_offset)
+                .for_each(|(iv, diag)| {
+                    let start = iv.start();
+                    let end = iv.end();
+
+                    if start <= end_offset
+                        && end >= start_offset
+                        && diag.severity < Some(DiagnosticSeverity::HINT)
+                    {
+                        let start = start.saturating_sub(start_offset);
+                        let end = end - start_offset;
+                        let start = phantom_text.col_after(start, true);
+                        let end = phantom_text.col_after(end, false);
+
+                        match (diag.severity, max_severity) {
+                            (Some(severity), Some(max)) => {
+                                if severity < max {
+                                    max_severity = Some(severity);
+                                }
+                            }
+                            (Some(severity), None) => {
+                                max_severity = Some(severity);
+                            }
+                            _ => {}
+                        }
+
+                        let color_name = match diag.severity {
+                            Some(DiagnosticSeverity::ERROR) => {
+                                LapceColor::LAPCE_ERROR
+                            }
+                            _ => LapceColor::LAPCE_WARN,
+                        };
+                        let color = config.color(color_name);
+                        let styles = extra_styles_for_range(
+                            layout,
+                            start,
+                            end,
+                            None,
+                            None,
+                            Some(color),
+                        );
+                        layout_line.extra_style.extend(styles);
+                    }
+                });
+        });
+
         // Add the styling for the diagnostic severity, if applicable
-        if let Some(max_severity) = doc.max_diag_severity(line) {
+        if let Some(max_severity) = max_severity {
             let theme_prop = if max_severity == DiagnosticSeverity::ERROR {
                 LapceColor::ERROR_LENS_ERROR_BACKGROUND
             } else if max_severity == DiagnosticSeverity::WARNING {
@@ -1857,59 +2167,6 @@ impl Styling for DocStyling {
                 wave_line: None,
             });
         }
-
-        doc.diagnostics.diagnostics.with_untracked(|diags| {
-            doc.buffer.with_untracked(|buffer| {
-                for diag in diags {
-                    if diag.diagnostic.range.start.line as usize <= line
-                        && line <= diag.diagnostic.range.end.line as usize
-                    {
-                        let start = if diag.diagnostic.range.start.line as usize
-                            == line
-                        {
-                            let (_, col) = buffer.offset_to_line_col(diag.range.0);
-                            col
-                        } else {
-                            let offset =
-                                buffer.first_non_blank_character_on_line(line);
-                            let (_, col) = buffer.offset_to_line_col(offset);
-                            col
-                        };
-                        let start = phantom_text.col_after(start, true);
-
-                        let end = if diag.diagnostic.range.end.line as usize == line
-                        {
-                            let (_, col) = buffer.offset_to_line_col(diag.range.1);
-                            col
-                        } else {
-                            buffer.line_end_col(line, true)
-                        };
-                        let end = phantom_text.col_after(end, false);
-
-                        // let x0 = text_layout.hit_position(start).point.x;
-                        // let x1 = text_layout.hit_position(end).point.x;
-                        let color_name = match diag.diagnostic.severity {
-                            Some(DiagnosticSeverity::ERROR) => {
-                                LapceColor::LAPCE_ERROR
-                            }
-                            _ => LapceColor::LAPCE_WARN,
-                        };
-                        let color = config.color(color_name);
-
-                        let styles = extra_styles_for_range(
-                            layout,
-                            start,
-                            end,
-                            None,
-                            None,
-                            Some(color),
-                        );
-
-                        layout_line.extra_style.extend(styles);
-                    }
-                }
-            })
-        });
     }
 
     fn paint_caret(&self, edid: EditorId, _line: usize) -> bool {
@@ -1944,10 +2201,12 @@ fn syntax_prev_unmatched(
 
 fn should_blink(
     focus: RwSignal<Focus>,
-    keyboard_focus: RwSignal<Option<floem::id::Id>>,
+    keyboard_focus: RwSignal<Option<ViewId>>,
 ) -> impl Fn() -> bool {
     move || {
-        let focus = focus.get_untracked();
+        let Some(focus) = focus.try_get_untracked() else {
+            return false;
+        };
         if matches!(
             focus,
             Focus::Workbench
@@ -2001,9 +2260,8 @@ fn extra_styles_for_range(
                 return None;
             }
 
-            let y = (run.line_height - run.glyph_ascent - run.glyph_descent) as f64
-                / 2.0;
-            let height = (run.glyph_ascent + run.glyph_descent) as f64;
+            let height = (run.max_ascent + run.max_descent) as f64;
+            let y = run.line_y as f64 - run.max_ascent as f64;
 
             Some(LineExtraStyle {
                 x,

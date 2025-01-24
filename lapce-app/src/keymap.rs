@@ -4,14 +4,14 @@ use floem::{
     event::{Event, EventListener},
     reactive::{
         create_effect, create_memo, create_rw_signal, Memo, ReadSignal, RwSignal,
-        Scope,
+        Scope, SignalGet, SignalUpdate, SignalWith,
     },
     style::CursorStyle,
-    view::View,
     views::{
         container, dyn_stack, label, scroll, stack, text, virtual_stack, Decorators,
         VirtualDirection, VirtualItemSize,
     },
+    View,
 };
 use lapce_core::mode::Modes;
 
@@ -284,6 +284,7 @@ pub fn keymap_view(editors: Editors, common: Rc<CommonData>) -> impl View {
             text_input_view
                 .placeholder(|| "Search Key Bindings".to_string())
                 .keyboard_navigatable()
+                .request_focus(|| {})
                 .style(move |s| {
                     s.width_pct(100.0)
                         .border_radius(6.0)
@@ -409,6 +410,7 @@ fn keyboard_picker_view(
                         s.padding_horiz(5.0)
                             .padding_vert(1.0)
                             .margin_right(5.0)
+                            .height(ui_line_height.get() as f32)
                             .border(1.0)
                             .border_radius(6.0)
                             .border_color(
@@ -423,7 +425,7 @@ fn keyboard_picker_view(
                     .justify_center()
                     .width_pct(100.0)
                     .margin_top(20.0)
-                    .height(ui_line_height.get() as f32 + 16.0)
+                    .height((ui_line_height.get() as f32) * 1.2)
                     .border(1.0)
                     .border_radius(6.0)
                     .border_color(config.color(LapceColor::LAPCE_BORDER))
@@ -500,6 +502,7 @@ fn keyboard_picker_view(
                     .border_color(config.color(LapceColor::LAPCE_BORDER))
             }),
         ))
+        .on_event_stop(EventListener::PointerDown, |_| {})
         .style(move |s| {
             let config = config.get();
             s.items_center()
@@ -516,18 +519,19 @@ fn keyboard_picker_view(
     .on_event_stop(EventListener::KeyDown, move |event| {
         if let Event::KeyDown(key_event) = event {
             if let Some(keypress) = KeyPressData::keypress(key_event) {
-                let keypress = keypress.keymap_press();
-                picker.keys.update(|keys| {
-                    if let Some((last_key, last_key_confirmed)) = keys.last() {
-                        if !*last_key_confirmed && last_key.is_modifiers() {
-                            keys.pop();
+                if let Some(keypress) = keypress.keymap_press() {
+                    picker.keys.update(|keys| {
+                        if let Some((last_key, last_key_confirmed)) = keys.last() {
+                            if !*last_key_confirmed && last_key.is_modifiers() {
+                                keys.pop();
+                            }
                         }
-                    }
-                    if keys.len() == 2 {
-                        keys.clear();
-                    }
-                    keys.push((keypress, false));
-                })
+                        if keys.len() == 2 {
+                            keys.clear();
+                        }
+                        keys.push((keypress, false));
+                    })
+                }
             }
         }
     })
@@ -546,7 +550,8 @@ fn keyboard_picker_view(
             .items_center()
             .justify_center()
             .apply_if(picker.keymap.with(|keymap| keymap.is_none()), |s| s.hide())
-    });
+    })
+    .debug_name("keyboard picker");
 
     let id = view.id();
     create_effect(move |_| {

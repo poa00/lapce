@@ -5,11 +5,13 @@ modal = false
 color-theme = "Lapce Dark"
 icon-theme = "Lapce Codicons"
 custom-titlebar = true
+file-explorer-double-click = false
+auto-reload-plugin = false
 
 [editor]
-font-family = "Monospace"
+font-family = "monospace"
 font-size = 13
-code-lens-font-size = 2
+code-glance-font-size = 2
 line-height = 1.5
 smart-tab = true
 tab-width = 4
@@ -21,7 +23,9 @@ wrap-style = "editor-width"
 wrap-column = 80
 wrap-width = 600                                             # px
 sticky-header = true
+completion-width = 600
 completion-show-documentation = true
+completion-item-show-detail = false
 show-signature = true
 signature-label-code-block = true
 auto-closing-matching-pairs = true
@@ -39,6 +43,7 @@ enable-inlay-hints = true
 inlay-hint-font-family = ""
 inlay-hint-font-size = 0
 enable-error-lens = true
+only-render-error-styling = true
 error-lens-end-of-line = true
 error-lens-font-family = ""
 error-lens-font-size = 0
@@ -74,16 +79,24 @@ windows = "default"
 [terminal.profiles]
 default = {}
 
+# [terminal.profiles.example]
+# command     = "cargo"
+# arguments   = ["run"]
+# environemnt = { "KEY" = "VALUE" }
+# workdir     = "/home/user"
+
 [ui]
+scale = +1.0
 font-family = ""
 font-size = 13
 icon-size = 0
 header-height = 36
 status-height = 25
 tab-min-width = 100
+tab-separator-height = "Content"
 scroll-width = 10
 drop-shadow-width = 0
-preview-editor-width = 0
+palette-width = 500
 hover-font-family = ""
 hover-font-size = 0
 trim-search-results-whitespace = true

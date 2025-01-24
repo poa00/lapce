@@ -9,7 +9,6 @@ use lapce_rpc::{
     proxy::{ProxyRpcHandler, ProxyStatus},
     terminal::TermId,
 };
-use lsp_types::Url;
 use tracing::error;
 
 use self::{remote::start_remote, ssh::SshRemote};
@@ -55,66 +54,76 @@ pub fn new_proxy(
     {
         let core_rpc = core_rpc.clone();
         let proxy_rpc = proxy_rpc.clone();
-        std::thread::spawn(move || {
-            core_rpc.notification(CoreNotification::ProxyStatus {
-                status: ProxyStatus::Connecting,
-            });
-            proxy_rpc.initialize(
-                workspace.path.clone(),
-                disabled_volts,
-                extra_plugin_paths,
-                plugin_configurations,
-                1,
-                1,
-            );
+        std::thread::Builder::new()
+            .name("ProxyRpcHandler".to_owned())
+            .spawn(move || {
+                core_rpc.notification(CoreNotification::ProxyStatus {
+                    status: ProxyStatus::Connecting,
+                });
+                proxy_rpc.initialize(
+                    workspace.path.clone(),
+                    disabled_volts,
+                    extra_plugin_paths,
+                    plugin_configurations,
+                    1,
+                    1,
+                );
 
-            match &workspace.kind {
-                LapceWorkspaceType::Local => {
-                    let core_rpc = core_rpc.clone();
-                    let proxy_rpc = proxy_rpc.clone();
-                    std::thread::spawn(move || {
-                        let mut dispatcher = Dispatcher::new(core_rpc, proxy_rpc);
-                        let proxy_rpc = dispatcher.proxy_rpc.clone();
-                        proxy_rpc.mainloop(&mut dispatcher);
-                    });
-                }
-                LapceWorkspaceType::RemoteSSH(remote) => {
-                    if let Err(e) = start_remote(
-                        SshRemote {
-                            ssh: remote.clone(),
-                        },
-                        core_rpc.clone(),
-                        proxy_rpc.clone(),
-                    ) {
-                        error!("Failed to start SSH remote: {e}");
+                match &workspace.kind {
+                    LapceWorkspaceType::Local => {
+                        let core_rpc = core_rpc.clone();
+                        let proxy_rpc = proxy_rpc.clone();
+                        std::thread::Builder::new()
+                            .name("Dispatcher".to_owned())
+                            .spawn(move || {
+                                let mut dispatcher =
+                                    Dispatcher::new(core_rpc, proxy_rpc);
+                                let proxy_rpc = dispatcher.proxy_rpc.clone();
+                                proxy_rpc.mainloop(&mut dispatcher);
+                            })
+                            .unwrap();
+                    }
+                    LapceWorkspaceType::RemoteSSH(remote) => {
+                        if let Err(e) = start_remote(
+                            SshRemote {
+                                ssh: remote.clone(),
+                            },
+                            core_rpc.clone(),
+                            proxy_rpc.clone(),
+                        ) {
+                            error!("Failed to start SSH remote: {e}");
+                        }
+                    }
+                    #[cfg(windows)]
+                    LapceWorkspaceType::RemoteWSL(remote) => {
+                        if let Err(e) = start_remote(
+                            wsl::WslRemote {
+                                wsl: remote.clone(),
+                            },
+                            core_rpc.clone(),
+                            proxy_rpc.clone(),
+                        ) {
+                            error!("Failed to start SSH remote: {e}");
+                        }
                     }
                 }
-                #[cfg(windows)]
-                LapceWorkspaceType::RemoteWSL(remote) => {
-                    if let Err(e) = start_remote(
-                        wsl::WslRemote {
-                            wsl: remote.clone(),
-                        },
-                        core_rpc.clone(),
-                        proxy_rpc.clone(),
-                    ) {
-                        error!("Failed to start SSH remote: {e}");
-                    }
-                }
-            }
-        });
+            })
+            .unwrap();
     }
 
     let (tx, rx) = crossbeam_channel::unbounded();
     {
         let core_rpc = core_rpc.clone();
-        std::thread::spawn(move || {
-            let mut proxy = Proxy { tx, term_tx };
-            core_rpc.mainloop(&mut proxy);
-            core_rpc.notification(CoreNotification::ProxyStatus {
-                status: ProxyStatus::Connected,
-            });
-        })
+        std::thread::Builder::new()
+            .name("CoreRpcHandler".to_owned())
+            .spawn(move || {
+                let mut proxy = Proxy { tx, term_tx };
+                core_rpc.mainloop(&mut proxy);
+                core_rpc.notification(CoreNotification::ProxyStatus {
+                    status: ProxyStatus::Connected,
+                });
+            })
+            .unwrap()
     };
 
     let notification = create_signal_from_channel(rx);
@@ -129,12 +138,17 @@ pub fn new_proxy(
 impl CoreHandler for Proxy {
     fn handle_notification(&mut self, rpc: lapce_rpc::core::CoreNotification) {
         if let CoreNotification::UpdateTerminal { term_id, content } = &rpc {
-            let _ = self
+            if let Err(err) = self
                 .term_tx
-                .send((*term_id, TermEvent::UpdateContent(content.to_vec())));
+                .send((*term_id, TermEvent::UpdateContent(content.to_vec())))
+            {
+                tracing::error!("{:?}", err);
+            }
             return;
         }
-        let _ = self.tx.send(rpc);
+        if let Err(err) = self.tx.send(rpc) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn handle_request(
@@ -143,29 +157,6 @@ impl CoreHandler for Proxy {
         _rpc: lapce_rpc::core::CoreRequest,
     ) {
     }
-}
-
-// Rust-analyzer returns paths in the form of "file:///<drive>:/...", which gets parsed into URL
-// as "/<drive>://" which is then interpreted by PathBuf::new() as a UNIX-like path from root.
-// This function strips the additional / from the beginning, if the first segment is a drive letter.
-#[cfg(windows)]
-pub fn path_from_url(url: &Url) -> PathBuf {
-    let path = url.path();
-    if let Some(path) = path.strip_prefix('/') {
-        if let Some((maybe_drive_letter, _)) = path.split_once(['/', '\\']) {
-            let b = maybe_drive_letter.as_bytes();
-            if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-                return PathBuf::from(path);
-            }
-        }
-    }
-    PathBuf::from(path)
-}
-
-#[cfg(not(windows))]
-pub fn path_from_url(url: &Url) -> PathBuf {
-    url.to_file_path()
-        .unwrap_or_else(|_| PathBuf::from(url.path()))
 }
 
 pub fn new_command(program: &str) -> Command {

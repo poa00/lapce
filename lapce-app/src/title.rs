@@ -4,16 +4,18 @@ use floem::{
     event::EventListener,
     menu::{Menu, MenuItem},
     peniko::Color,
-    reactive::{create_memo, Memo, ReadSignal, RwSignal},
+    reactive::{
+        create_memo, Memo, ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith,
+    },
     style::{AlignItems, CursorStyle, JustifyContent},
-    view::View,
     views::{container, drag_window_area, empty, label, stack, svg, Decorators},
+    View,
 };
 use lapce_core::meta;
 use lapce_rpc::proxy::ProxyStatus;
 
 use crate::{
-    app::{clickable_icon, not_clickable_icon, window_menu},
+    app::{clickable_icon, not_clickable_icon, tooltip_label, window_menu},
     command::{LapceCommand, LapceWorkbenchCommand, WindowCommand},
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     listener::Listener,
@@ -63,20 +65,24 @@ fn left(
                 .margin_right(6.0)
                 .apply_if(is_macos, |s| s.hide())
         }),
-        container(svg(move || config.get().ui_svg(LapceIcons::REMOTE)).style(
-            move |s| {
-                let config = config.get();
-                let size = (config.ui.icon_size() as f32 + 2.0).min(30.0);
-                s.size(size, size).color(if is_local {
-                    config.color(LapceColor::LAPCE_ICON_ACTIVE)
-                } else {
-                    match proxy_status.get() {
-                        Some(_) => Color::WHITE,
-                        None => config.color(LapceColor::LAPCE_ICON_ACTIVE),
-                    }
-                })
-            },
-        ))
+        tooltip_label(
+            config,
+            container(svg(move || config.get().ui_svg(LapceIcons::REMOTE)).style(
+                move |s| {
+                    let config = config.get();
+                    let size = (config.ui.icon_size() as f32 + 2.0).min(30.0);
+                    s.size(size, size).color(if is_local {
+                        config.color(LapceColor::LAPCE_ICON_ACTIVE)
+                    } else {
+                        match proxy_status.get() {
+                            Some(_) => Color::WHITE,
+                            None => config.color(LapceColor::LAPCE_ICON_ACTIVE),
+                        }
+                    })
+                },
+            )),
+            || "Connect to Remote",
+        )
         .popout_menu(move || {
             #[allow(unused_mut)]
             let mut menu = Menu::new("").entry(
@@ -149,6 +155,7 @@ fn left(
             .flex_grow(1.0)
             .items_center()
     })
+    .debug_name("Left Side of Top Bar")
 }
 
 fn middle(
@@ -240,7 +247,7 @@ fn middle(
                         "Open Folder".to_string()
                     }
                 })
-                .style(|s| s.padding_left(10).padding_right(5)),
+                .style(|s| s.padding_left(10).padding_right(5).selectable(false)),
                 open_folder(),
             ))
             .style(|s| s.align_items(Some(AlignItems::Center))),
@@ -248,7 +255,7 @@ fn middle(
         .on_event_stop(EventListener::PointerDown, |_| {})
         .on_click_stop(move |_| {
             if workspace.clone().path.is_some() {
-                workbench_command.send(LapceWorkbenchCommand::Palette);
+                workbench_command.send(LapceWorkbenchCommand::PaletteHelpAndFile);
             } else {
                 workbench_command.send(LapceWorkbenchCommand::PaletteWorkspace);
             }
@@ -294,6 +301,7 @@ fn middle(
             .align_items(Some(AlignItems::Center))
             .justify_content(Some(JustifyContent::Center))
     })
+    .debug_name("Middle of Top Bar")
 }
 
 fn right(
@@ -405,6 +413,7 @@ fn right(
             .flex_grow(1.0)
             .justify_content(Some(JustifyContent::FlexEnd))
     })
+    .debug_name("Right of top bar")
 }
 
 pub fn title(window_tab_data: Rc<WindowTabData>) -> impl View {
@@ -459,6 +468,7 @@ pub fn title(window_tab_data: Rc<WindowTabData>) -> impl View {
             .border_bottom(1.0)
             .border_color(config.color(LapceColor::LAPCE_BORDER))
     })
+    .debug_name("Title / Top Bar")
 }
 
 pub fn window_controls_view(

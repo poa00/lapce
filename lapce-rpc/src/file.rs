@@ -173,7 +173,7 @@ impl Naming {
     }
 
     pub fn is_accepting_input(&self) -> bool {
-        self.state().map_or(false, NamingState::is_accepting_input)
+        self.state().is_some_and(NamingState::is_accepting_input)
     }
 
     pub fn editor_needs_reset(&self) -> bool {
@@ -232,6 +232,7 @@ impl Naming {
                     err: n.state.err().map(ToString::to_string),
                 },
                 is_dir: n.is_dir,
+                is_root: false,
                 open: false,
                 level: level + 1,
             }),
@@ -241,6 +242,7 @@ impl Naming {
                     err: d.state.err().map(ToString::to_string),
                 },
                 is_dir,
+                is_root: false,
                 open: false,
                 level: level + 1,
             }),
@@ -253,6 +255,7 @@ impl Naming {
 pub struct FileNodeViewData {
     pub kind: FileNodeViewKind,
     pub is_dir: bool,
+    pub is_root: bool,
     pub open: bool,
     pub level: usize,
 }
@@ -261,13 +264,13 @@ pub struct FileNodeViewData {
 pub struct FileNodeItem {
     pub path: PathBuf,
     pub is_dir: bool,
-    /// Whether the directory's children have been read.  
+    /// Whether the directory's children have been read.
     /// Does nothing if not a directory.
     pub read: bool,
     /// Whether the directory is open in the explorer view.
     pub open: bool,
     pub children: HashMap<PathBuf, FileNodeItem>,
-    /// The number of child (directories) that are open themselves  
+    /// The number of child (directories) that are open themselves
     /// Used for sizing of the explorer list
     pub children_open_count: usize,
 }
@@ -298,7 +301,7 @@ impl Ord for FileNodeItem {
 }
 
 impl FileNodeItem {
-    /// Collect the children, sorted by name.  
+    /// Collect the children, sorted by name.
     /// Note: this will be empty if the directory has not been read.
     pub fn sorted_children(&self) -> Vec<&FileNodeItem> {
         let mut children = self.children.values().collect::<Vec<&FileNodeItem>>();
@@ -306,7 +309,7 @@ impl FileNodeItem {
         children
     }
 
-    /// Collect the children, sorted by name.  
+    /// Collect the children, sorted by name.
     /// Note: this will be empty if the directory has not been read.
     pub fn sorted_children_mut(&mut self) -> Vec<&mut FileNodeItem> {
         let mut children = self
@@ -366,7 +369,7 @@ impl FileNodeItem {
             .try_fold(self, |node, path| node.children.get_mut(path))
     }
 
-    /// Remove a specific child from the node.  
+    /// Remove a specific child from the node.
     /// The path is recursive and will remove the child from parent indicated by the path.
     pub fn remove_child(&mut self, path: &Path) -> Option<FileNodeItem> {
         let parent = path.parent()?;
@@ -401,7 +404,7 @@ impl FileNodeItem {
         Some(())
     }
 
-    /// Set the children of the node.  
+    /// Set the children of the node.
     /// Note: this opens the node.
     pub fn set_item_children(
         &mut self,
@@ -472,12 +475,38 @@ impl FileNodeItem {
             view_items.push(FileNodeViewData {
                 kind,
                 is_dir: self.is_dir,
+                is_root: level == 1,
                 open: self.open,
                 level,
             });
         }
 
         self.append_children_view_slice(view_items, naming, min, max, current, level)
+    }
+
+    /// Calculate the row where the file resides
+    pub fn find_file_at_line(&self, file_path: &Path) -> (bool, f64) {
+        let mut line = 0.0;
+        if !self.open {
+            return (false, line);
+        }
+        for item in self.sorted_children() {
+            line += 1.0;
+            match (item.is_dir, item.open, item.path == file_path) {
+                (_, _, true) => {
+                    return (true, line);
+                }
+                (true, true, _) => {
+                    let (found, item_position) = item.find_file_at_line(file_path);
+                    line += item_position;
+                    if found {
+                        return (true, line);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (false, line)
     }
 
     /// Append the children of this item with the given level

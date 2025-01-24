@@ -9,8 +9,8 @@ pub struct ConfigWatcher {
 
 impl notify::EventHandler for ConfigWatcher {
     fn handle_event(&mut self, event: notify::Result<notify::Event>) {
-        if let Ok(event) = event {
-            match event.kind {
+        match event {
+            Ok(event) => match event.kind {
                 notify::EventKind::Create(_)
                 | notify::EventKind::Modify(_)
                 | notify::EventKind::Remove(_) => {
@@ -30,13 +30,18 @@ impl notify::EventHandler for ConfigWatcher {
                             std::thread::sleep(std::time::Duration::from_millis(
                                 500,
                             ));
-                            let _ = tx.send(());
+                            if let Err(err) = tx.send(()) {
+                                tracing::error!("{:?}", err);
+                            }
                             config_mutex
                                 .store(false, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
                 }
                 _ => {}
+            },
+            Err(err) => {
+                tracing::error!("{:?}", err);
             }
         }
     }

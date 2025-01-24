@@ -1,4 +1,4 @@
-use floem::cosmic_text::{
+use floem::text::{
     Attrs, AttrsList, FamilyOwned, LineHeightValue, Style, TextLayout, Weight,
 };
 use lapce_core::{language::LapceLanguage, syntax::Syntax};
@@ -184,6 +184,8 @@ pub fn parse_markdown(
             Event::FootnoteReference(_text) => {}
             Event::TaskListMarker(_text) => {}
             Event::InlineHtml(_) => {} // TODO(panekj): Implement
+            Event::InlineMath(_) => {} // TODO(panekj): Implement
+            Event::DisplayMath(_) => {} // TODO(panekj): Implement
         }
     }
 
@@ -227,7 +229,7 @@ fn attribute_for_tag<'a>(
                     .weight(Weight::BOLD),
             )
         }
-        Tag::BlockQuote => Some(
+        Tag::BlockQuote(_block_quote) => Some(
             default_attrs
                 .style(Style::Italic)
                 .color(config.color(LapceColor::MARKDOWN_BLOCKQUOTE)),
@@ -308,14 +310,14 @@ pub fn from_marked_string(
     config: &LapceConfig,
 ) -> Vec<MarkdownContent> {
     match text {
-        MarkedString::String(text) => parse_markdown(&text, 1.5, config),
+        MarkedString::String(text) => parse_markdown(&text, 1.8, config),
         // This is a short version of a code block
         MarkedString::LanguageString(code) => {
             // TODO: We could simply construct the MarkdownText directly
             // Simply construct the string as if it was written directly
             parse_markdown(
                 &format!("```{}\n{}\n```", code.language, code.value),
-                1.5,
+                1.8,
                 config,
             )
         }

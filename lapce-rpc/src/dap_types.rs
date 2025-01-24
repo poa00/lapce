@@ -57,6 +57,23 @@ pub struct RunDebugConfig {
     pub debug_command: Option<Vec<String>>,
     #[serde(skip)]
     pub dap_id: DapId,
+    #[serde(default)]
+    pub tracing_output: bool,
+    #[serde(default)]
+    pub config_source: ConfigSource,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq, Eq)]
+pub enum ConfigSource {
+    #[default]
+    Palette,
+    RunInTerminal,
+    CodeLens,
+}
+impl ConfigSource {
+    pub fn from_palette(&self) -> bool {
+        *self == Self::Palette
+    }
 }
 
 pub trait Request {
@@ -74,6 +91,7 @@ pub struct DapRequest {
 
 #[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
 pub struct DapResponse {
+    pub seq: u64,
     pub request_seq: u64,
     pub success: bool,
     pub command: String,

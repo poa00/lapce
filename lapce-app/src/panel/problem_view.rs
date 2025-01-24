@@ -2,21 +2,24 @@ use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use floem::{
     peniko::Color,
-    reactive::{create_memo, create_rw_signal, ReadSignal},
+    reactive::{
+        create_effect, create_rw_signal, ReadSignal, SignalGet, SignalUpdate,
+        SignalWith,
+    },
     style::{CursorStyle, Style},
-    view::View,
     views::{container, dyn_stack, label, scroll, stack, svg, Decorators},
+    View,
 };
 use lsp_types::{DiagnosticRelatedInformation, DiagnosticSeverity};
 
-use super::{position::PanelPosition, view::PanelBuilder};
+use super::{data::PanelSection, position::PanelPosition, view::PanelBuilder};
 use crate::{
     command::InternalCommand,
     config::{color::LapceColor, icon::LapceIcons, LapceConfig},
     doc::{DiagnosticData, EditorDiagnostic},
     editor::location::{EditorLocation, EditorPosition},
     listener::Listener,
-    proxy::path_from_url,
+    lsp::path_from_url,
     window_tab::WindowTabData,
     workspace::LapceWorkspace,
 };
@@ -31,6 +34,7 @@ pub fn problem_panel(
         .add_style(
             "Errors",
             problem_section(window_tab_data.clone(), DiagnosticSeverity::ERROR),
+            window_tab_data.panel.section_open(PanelSection::Error),
             move |s| {
                 s.border_color(config.get().color(LapceColor::LAPCE_BORDER))
                     .apply_if(is_bottom, |s| s.border_right(1.0))
@@ -40,8 +44,10 @@ pub fn problem_panel(
         .add(
             "Warnings",
             problem_section(window_tab_data.clone(), DiagnosticSeverity::WARNING),
+            window_tab_data.panel.section_open(PanelSection::Warn),
         )
         .build()
+        .debug_name("Problem Panel")
 }
 
 fn problem_section(
@@ -67,7 +73,7 @@ fn problem_section(
                     )
                 },
             )
-            .style(|s| s.flex_col().width_pct(100.0).line_height(1.6)),
+            .style(|s| s.flex_col().width_pct(100.0).line_height(1.8)),
         )
         .style(|s| s.absolute().size_pct(100.0, 100.0))
     })
@@ -84,19 +90,40 @@ fn file_view(
 ) -> impl View {
     let collpased = create_rw_signal(false);
 
-    let diagnostics = create_memo(move |_| {
-        let diagnostics = diagnostic_data.diagnostics.get();
-        let diagnostics: im::Vector<EditorDiagnostic> = diagnostics
-            .into_iter()
-            .filter_map(|d| {
-                if d.diagnostic.severity == Some(severity) {
-                    Some(d)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        diagnostics
+    let diagnostics = create_rw_signal(im::Vector::new());
+    create_effect(move |_| {
+        let span = diagnostic_data.diagnostics_span.get();
+        let d = if !span.is_empty() {
+            span.iter()
+                .filter_map(|(iv, diag)| {
+                    if diag.severity == Some(severity) {
+                        Some(EditorDiagnostic {
+                            range: Some((iv.start, iv.end)),
+                            diagnostic: diag.to_owned(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect::<im::Vector<EditorDiagnostic>>()
+        } else {
+            let diagnostics = diagnostic_data.diagnostics.get();
+            let diagnostics: im::Vector<EditorDiagnostic> = diagnostics
+                .into_iter()
+                .filter_map(|d| {
+                    if d.severity == Some(severity) {
+                        Some(EditorDiagnostic {
+                            range: None,
+                            diagnostic: d,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            diagnostics
+        };
+        diagnostics.set(d);
     });
 
     let full_path = path.clone();
@@ -138,12 +165,16 @@ fn file_view(
             container(
                 stack((
                     label(move || file_name.clone()).style(|s| {
-                        s.margin_right(6.0).max_width_pct(100.0).text_ellipsis()
+                        s.margin_right(6.0)
+                            .max_width_pct(100.0)
+                            .text_ellipsis()
+                            .selectable(false)
                     }),
                     label(move || folder.clone()).style(move |s| {
                         s.color(config.get().color(LapceColor::EDITOR_DIM))
                             .min_width(0.0)
                             .text_ellipsis()
+                            .selectable(false)
                     }),
                 ))
                 .style(move |s| s.width_pct(100.0).min_width(0.0)),
@@ -186,7 +217,7 @@ fn file_view(
                         .size(size, size)
                         .apply_opt(color, Style::color)
                 }),
-                label(|| " ".to_string()),
+                label(|| " ".to_string()).style(move |s| s.selectable(false)),
             ))
             .style(|s| s.absolute().items_center().margin_left(10.0)),
         ))
@@ -199,7 +230,7 @@ fn file_view(
                     diagnostics.get()
                 }
             },
-            |_| 0,
+            |d| (d.range, d.diagnostic.range),
             move |d| {
                 item_view(
                     full_path.clone(),
@@ -230,9 +261,14 @@ fn item_view(
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let related = d.diagnostic.related_information.unwrap_or_default();
+    let position = if let Some((start, _)) = d.range {
+        EditorPosition::Offset(start)
+    } else {
+        EditorPosition::Position(d.diagnostic.range.start)
+    };
     let location = EditorLocation {
         path,
-        position: Some(EditorPosition::Position(d.diagnostic.range.start)),
+        position: Some(position),
         scroll_offset: None,
         ignore_unconfirmed: false,
         same_editor_tab: false,
@@ -254,7 +290,7 @@ fn item_view(
                         let size = config.ui.icon_size() as f32;
                         s.size(size, size).color(icon_color())
                     }),
-                    label(|| " ".to_string()),
+                    label(|| " ".to_string()).style(move |s| s.selectable(false)),
                 ))
                 .style(move |s| {
                     s.absolute().items_center().margin_left(
@@ -345,7 +381,7 @@ fn related_view(
                 s.size(size, size)
                     .color(config.color(LapceColor::EDITOR_DIM))
             }),
-            label(|| " ".to_string()),
+            label(|| " ".to_string()).style(move |s| s.selectable(false)),
         ))
         .style(move |s| {
             s.absolute()

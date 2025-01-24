@@ -1,7 +1,9 @@
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{path::PathBuf, rc::Rc};
 
+pub use floem::views::editor::command::CommandExecuted;
 use floem::{
     keyboard::Modifiers, peniko::kurbo::Vec2, views::editor::command::Command,
+    ViewId,
 };
 use indexmap::IndexMap;
 use lapce_core::command::{
@@ -26,11 +28,9 @@ use crate::{
     editor::location::EditorLocation,
     editor_tab::EditorTabChild,
     id::EditorTabId,
-    main_split::{SplitDirection, SplitMoveDirection},
+    main_split::{SplitDirection, SplitMoveDirection, TabCloseKind},
     workspace::LapceWorkspace,
 };
-
-pub use floem::views::editor::command::CommandExecuted;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LapceCommand {
@@ -183,6 +183,40 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "Open File")]
     OpenFile,
 
+    #[strum(serialize = "show_call_hierarchy")]
+    #[strum(message = "Show Call Hierarchy")]
+    ShowCallHierarchy,
+
+    #[strum(serialize = "find_references")]
+    #[strum(message = "Find References")]
+    FindReferences,
+
+    #[strum(serialize = "go_to_implementation")]
+    #[strum(message = "Go to Implementation")]
+    GoToImplementation,
+
+    #[strum(serialize = "reveal_in_panel")]
+    #[strum(message = "Reveal in Panel")]
+    RevealInPanel,
+
+    #[strum(serialize = "source_control_open_active_file_remote_url")]
+    #[strum(message = "Source Control: Open Remote File Url")]
+    SourceControlOpenActiveFileRemoteUrl,
+
+    #[cfg(not(target_os = "macos"))]
+    #[strum(serialize = "reveal_in_file_explorer")]
+    #[strum(message = "Reveal in System File Explorer")]
+    RevealInFileExplorer,
+
+    #[cfg(target_os = "macos")]
+    #[strum(serialize = "reveal_in_file_explorer")]
+    #[strum(message = "Reveal in Finder")]
+    RevealInFileExplorer,
+
+    #[strum(serialize = "run_in_terminal")]
+    #[strum(message = "Run in Terminal")]
+    RunInTerminal,
+
     #[strum(serialize = "reveal_active_file_in_file_explorer")]
     #[strum(message = "Reveal Active File in File Explorer")]
     RevealActiveFileInFileExplorer,
@@ -190,6 +224,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "open_ui_inspector")]
     #[strum(message = "Open Internal UI Inspector")]
     OpenUIInspector,
+
+    #[strum(serialize = "show_env")]
+    #[strum(message = "Show Environment")]
+    ShowEnvironment,
 
     #[strum(serialize = "change_color_theme")]
     #[strum(message = "Change Color Theme")]
@@ -242,6 +280,14 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "open_plugins_directory")]
     #[strum(message = "Open Plugins Directory")]
     OpenPluginsDirectory,
+
+    #[strum(serialize = "open_grammars_directory")]
+    #[strum(message = "Open Grammars Directory")]
+    OpenGrammarsDirectory,
+
+    #[strum(serialize = "open_queries_directory")]
+    #[strum(message = "Open Queries Directory")]
+    OpenQueriesDirectory,
 
     #[strum(serialize = "zoom_in")]
     #[strum(message = "Zoom In")]
@@ -351,6 +397,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "List Palette Types")]
     #[strum(serialize = "palette.palette_help")]
     PaletteHelp,
+
+    #[strum(message = "List Palette Types and Files")]
+    #[strum(serialize = "palette.palette_help_and_file")]
+    PaletteHelpAndFile,
 
     #[strum(message = "Run and Debug Restart Current Running")]
     #[strum(serialize = "palette.run_and_debug_restart")]
@@ -542,12 +592,23 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "quit")]
     #[strum(message = "Quit Editor")]
     Quit,
+
+    #[strum(serialize = "go_to_location")]
+    #[strum(message = "Go to Location")]
+    GoToLocation,
+
+    #[strum(serialize = "add_run_debug_config")]
+    #[strum(message = "Add Run Debug Config")]
+    AddRunDebugConfig,
 }
 
 #[derive(Clone, Debug)]
 pub enum InternalCommand {
     ReloadConfig,
     OpenFile {
+        path: PathBuf,
+    },
+    OpenAndConfirmedFile {
         path: PathBuf,
     },
     OpenFileInNewTab {
@@ -621,10 +682,16 @@ pub enum InternalCommand {
         editor_tab_id: EditorTabId,
         child: EditorTabChild,
     },
+    EditorTabCloseByKind {
+        editor_tab_id: EditorTabId,
+        child: EditorTabChild,
+        kind: TabCloseKind,
+    },
     ShowCodeActions {
         offset: usize,
         mouse_click: bool,
-        code_actions: Arc<(PluginId, Vec<CodeActionOrCommand>)>,
+        plugin_id: PluginId,
+        code_actions: im::Vector<CodeActionOrCommand>,
     },
     RunCodeAction {
         plugin_id: PluginId,
@@ -711,6 +778,24 @@ pub enum InternalCommand {
     OpenDiffFiles {
         left_path: PathBuf,
         right_path: PathBuf,
+    },
+    ExecuteProcess {
+        program: String,
+        arguments: Vec<String>,
+    },
+    ClearTerminalBuffer {
+        view_id: ViewId,
+        tab_index: usize,
+        terminal_index: usize,
+    },
+    CallHierarchyIncoming {
+        item_id: ViewId,
+    },
+    StopTerminal {
+        term_id: TermId,
+    },
+    RestartTerminal {
+        term_id: TermId,
     },
 }
 

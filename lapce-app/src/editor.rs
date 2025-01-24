@@ -13,7 +13,10 @@ use floem::{
     kurbo::{Point, Rect, Vec2},
     menu::{Menu, MenuItem},
     pointer::{PointerButton, PointerInputEvent, PointerMoveEvent},
-    reactive::{batch, use_context, ReadSignal, RwSignal, Scope},
+    reactive::{
+        batch, use_context, ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate,
+        SignalWith,
+    },
     views::editor::{
         command::CommandExecuted,
         id::EditorId,
@@ -25,7 +28,9 @@ use floem::{
         visual_line::{ConfigId, Lines, TextLayoutProvider, VLine, VLineInfo},
         Editor,
     },
+    ViewId,
 };
+use itertools::Itertools;
 use lapce_core::{
     buffer::{
         diff::DiffLines,
@@ -45,11 +50,18 @@ use lapce_core::{
 use lapce_rpc::{buffer::BufferId, plugin::PluginId, proxy::ProxyResponse};
 use lapce_xi_rope::{Rope, RopeDelta, Transformer};
 use lsp_types::{
-    CompletionItem, CompletionTextEdit, GotoDefinitionResponse, HoverContents,
-    InlineCompletionTriggerKind, Location, MarkedString, MarkupKind, TextEdit,
+    CodeActionResponse, CompletionItem, CompletionTextEdit, GotoDefinitionResponse,
+    HoverContents, InlayHint, InlayHintLabel, InlineCompletionTriggerKind, Location,
+    MarkedString, MarkupKind, Range, TextEdit,
 };
+use nucleo::Utf32Str;
 use serde::{Deserialize, Serialize};
+use view::StickyHeaderInfo;
 
+use self::{
+    diff::DiffInfo,
+    location::{EditorLocation, EditorPosition},
+};
 use crate::{
     command::{CommandKind, InternalCommand, LapceCommand, LapceWorkbenchCommand},
     completion::CompletionStatus,
@@ -60,18 +72,19 @@ use crate::{
     id::{DiffEditorId, EditorTabId},
     inline_completion::{InlineCompletionItem, InlineCompletionStatus},
     keypress::{condition::Condition, KeyPressFocus},
+    lsp::path_from_url,
     main_split::{Editors, MainSplitData, SplitDirection, SplitMoveDirection},
     markdown::{
         from_marked_string, from_plaintext, parse_markdown, MarkdownContent,
     },
-    proxy::path_from_url,
+    panel::{
+        call_hierarchy_view::CallHierarchyItemData,
+        implementation_view::{init_implementation_root, map_to_location},
+        kind::PanelKind,
+    },
     snippet::Snippet,
+    tracing::*,
     window_tab::{CommonData, Focus, WindowTabData},
-};
-
-use self::{
-    diff::DiffInfo,
-    location::{EditorLocation, EditorPosition},
 };
 
 pub mod diff;
@@ -88,7 +101,7 @@ pub enum InlineFindDirection {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EditorInfo {
     pub content: DocContent,
-    // pub unsaved: Option<String>,
+    pub unsaved: Option<String>,
     pub offset: usize,
     pub scroll_offset: (f64, f64),
 }
@@ -103,7 +116,8 @@ impl EditorInfo {
         let common = data.common.clone();
         match &self.content {
             DocContent::File { path, .. } => {
-                let (doc, new_doc) = data.get_doc(path.clone());
+                let (doc, new_doc) =
+                    data.get_doc(path.clone(), self.unsaved.clone());
                 let editor = editors.make_from_doc(
                     data.scope,
                     doc,
@@ -149,6 +163,9 @@ impl EditorInfo {
                             data.common.clone(),
                         );
                         let doc = Rc::new(doc);
+                        if let Some(unsaved) = &self.unsaved {
+                            doc.reload(Rope::from(unsaved), false);
+                        }
                         scratch_docs.insert(name.to_string(), doc.clone());
                         doc
                     })
@@ -179,10 +196,17 @@ impl EditorViewKind {
     }
 }
 
+#[derive(Clone)]
+pub struct OnScreenFind {
+    pub active: bool,
+    pub pattern: String,
+    pub regions: Vec<SelRegion>,
+}
+
 pub type SnippetIndex = Vec<(usize, (usize, usize))>;
 
 /// Shares data between cloned instances as long as the signals aren't swapped out.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EditorData {
     pub scope: Scope,
     pub editor_tab_id: RwSignal<Option<EditorTabId>>,
@@ -190,18 +214,22 @@ pub struct EditorData {
     pub confirmed: RwSignal<bool>,
     pub snippet: RwSignal<Option<SnippetIndex>>,
     pub inline_find: RwSignal<Option<InlineFindDirection>>,
+    pub on_screen_find: RwSignal<OnScreenFind>,
     pub last_inline_find: RwSignal<Option<(InlineFindDirection, String)>>,
     pub find_focus: RwSignal<bool>,
     pub editor: Rc<Editor>,
     pub kind: RwSignal<EditorViewKind>,
     pub sticky_header_height: RwSignal<f64>,
     pub common: Rc<CommonData>,
+    pub sticky_header_info: RwSignal<StickyHeaderInfo>,
 }
+
 impl PartialEq for EditorData {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
     }
 }
+
 impl EditorData {
     fn new(
         cx: Scope,
@@ -221,12 +249,18 @@ impl EditorData {
             confirmed,
             snippet: cx.create_rw_signal(None),
             inline_find: cx.create_rw_signal(None),
+            on_screen_find: cx.create_rw_signal(OnScreenFind {
+                active: false,
+                pattern: "".to_string(),
+                regions: Vec::new(),
+            }),
             last_inline_find: cx.create_rw_signal(None),
             find_focus: cx.create_rw_signal(false),
             editor: Rc::new(editor),
             kind: cx.create_rw_signal(EditorViewKind::Normal),
             sticky_header_height: cx.create_rw_signal(0.0),
             common,
+            sticky_header_info: cx.create_rw_signal(StickyHeaderInfo::default()),
         }
     }
 
@@ -315,8 +349,16 @@ impl EditorData {
     pub fn editor_info(&self, _data: &WindowTabData) -> EditorInfo {
         let offset = self.cursor().get_untracked().offset();
         let scroll_offset = self.viewport().get_untracked().origin();
+        let doc = self.doc();
+        let is_pristine = doc.is_pristine();
+        let unsaved = if is_pristine {
+            None
+        } else {
+            Some(doc.buffer.with_untracked(|b| b.to_string()))
+        };
         EditorInfo {
             content: self.doc().content.get_untracked(),
+            unsaved,
             offset,
             scroll_offset: (scroll_offset.x, scroll_offset.y),
         }
@@ -417,6 +459,7 @@ impl EditorData {
             // Cancel so that there's no flickering
             self.cancel_inline_completion();
             self.update_inline_completion(InlineCompletionTriggerKind::Automatic);
+            self.quit_on_screen_find();
         } else if show_inline_completion(cmd) {
             self.update_inline_completion(InlineCompletionTriggerKind::Automatic);
         } else {
@@ -426,6 +469,7 @@ impl EditorData {
         self.apply_deltas(&deltas);
         if let EditCommand::NormalMode = cmd {
             self.snippet.set(None);
+            self.quit_on_screen_find();
         }
 
         CommandExecuted::Yes
@@ -732,7 +776,9 @@ impl EditorData {
                 self.cancel_completion();
             }
             FocusCommand::SplitVertical => {
-                if let Some(editor_tab_id) = self.editor_tab_id.get_untracked() {
+                if let Some(editor_tab_id) =
+                    self.editor_tab_id.read_only().get_untracked()
+                {
                     self.common.internal_command.send(InternalCommand::Split {
                         direction: SplitDirection::Vertical,
                         editor_tab_id,
@@ -1010,6 +1056,13 @@ impl EditorData {
             FocusCommand::InlineFindRight => {
                 self.inline_find.set(Some(InlineFindDirection::Right));
             }
+            FocusCommand::OnScreenFind => {
+                self.on_screen_find.update(|find| {
+                    find.active = true;
+                    find.pattern.clear();
+                    find.regions.clear();
+                });
+            }
             FocusCommand::RepeatLastInlineFind => {
                 if let Some((direction, c)) = self.last_inline_find.get_untracked() {
                     self.inline_find(direction, &c);
@@ -1110,6 +1163,72 @@ impl EditorData {
                 Modifiers::empty(),
             );
         }
+    }
+
+    fn quit_on_screen_find(&self) {
+        if self.on_screen_find.with_untracked(|s| s.active) {
+            self.on_screen_find.update(|f| {
+                f.active = false;
+                f.pattern.clear();
+                f.regions.clear();
+            })
+        }
+    }
+
+    fn on_screen_find(&self, pattern: &str) -> Vec<SelRegion> {
+        let screen_lines = self.screen_lines().get_untracked();
+        let lines: HashSet<usize> =
+            screen_lines.lines.iter().map(|l| l.line).collect();
+
+        let mut matcher = nucleo::Matcher::new(nucleo::Config::DEFAULT);
+        let pattern = nucleo::pattern::Pattern::parse(
+            pattern,
+            nucleo::pattern::CaseMatching::Ignore,
+            nucleo::pattern::Normalization::Smart,
+        );
+        let mut indices = Vec::new();
+        let mut filter_text_buf = Vec::new();
+        let mut items = Vec::new();
+
+        let buffer = self.doc().buffer;
+
+        for line in lines {
+            filter_text_buf.clear();
+            indices.clear();
+
+            buffer.with_untracked(|buffer| {
+                let start = buffer.offset_of_line(line);
+                let end = buffer.offset_of_line(line + 1);
+                let text = buffer.text().slice_to_cow(start..end);
+                let filter_text = Utf32Str::new(&text, &mut filter_text_buf);
+
+                if let Some(score) =
+                    pattern.indices(filter_text, &mut matcher, &mut indices)
+                {
+                    indices.sort();
+                    let left =
+                        start + indices.first().copied().unwrap_or(0) as usize;
+                    let right =
+                        start + indices.last().copied().unwrap_or(0) as usize + 1;
+                    let right = if right == left { left + 1 } else { right };
+                    items.push((score, left, right));
+                }
+            });
+        }
+
+        items.sort_by_key(|(score, _, _)| -(*score as i64));
+        if let Some((_, offset, _)) = items.first().copied() {
+            self.run_move_command(
+                &lapce_core::movement::Movement::Offset(offset),
+                None,
+                Modifiers::empty(),
+            );
+        }
+
+        items
+            .into_iter()
+            .map(|(_, start, end)| SelRegion::new(start, end, None))
+            .collect()
     }
 
     fn go_to_definition(&self) {
@@ -1251,6 +1370,177 @@ impl EditorData {
         );
     }
 
+    pub fn call_hierarchy(&self, window_tab_data: WindowTabData) {
+        let doc = self.doc();
+        let path = match if doc.loaded() {
+            doc.content.with_untracked(|c| c.path().cloned())
+        } else {
+            None
+        } {
+            Some(path) => path,
+            None => return,
+        };
+
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let (_start_position, position) = doc.buffer.with_untracked(|buffer| {
+            let start_offset = buffer.prev_code_boundary(offset);
+            let start_position = buffer.offset_to_position(start_offset);
+            let position = buffer.offset_to_position(offset);
+            (start_position, position)
+        });
+        let scope = window_tab_data.scope;
+        let range = Range {
+            start: _start_position,
+            end: position,
+        };
+        self.common.proxy.show_call_hierarchy(
+            path,
+            position,
+            create_ext_action(self.scope, move |result| {
+                if let Ok(ProxyResponse::ShowCallHierarchyResponse {
+                    items, ..
+                }) = result
+                {
+                    if let Some(item) = items.and_then(|x| x.into_iter().next()) {
+                        let root = scope.create_rw_signal(CallHierarchyItemData {
+                            view_id: ViewId::new(),
+                            item: Rc::new(item),
+                            from_range: range,
+                            init: false,
+                            open: scope.create_rw_signal(true),
+                            children: scope.create_rw_signal(Vec::with_capacity(0)),
+                        });
+                        let item = root;
+                        window_tab_data.call_hierarchy_data.root.update(|x| {
+                            *x = Some(root);
+                        });
+                        window_tab_data.show_panel(PanelKind::CallHierarchy);
+                        window_tab_data.common.internal_command.send(
+                            InternalCommand::CallHierarchyIncoming {
+                                item_id: item.get_untracked().view_id,
+                            },
+                        );
+                    }
+                }
+            }),
+        );
+    }
+
+    pub fn find_refenrence(&self, window_tab_data: WindowTabData) {
+        let doc = self.doc();
+        let path = match if doc.loaded() {
+            doc.content.with_untracked(|c| c.path().cloned())
+        } else {
+            None
+        } {
+            Some(path) => path,
+            None => return,
+        };
+
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let (_start_position, position) = doc.buffer.with_untracked(|buffer| {
+            let start_offset = buffer.prev_code_boundary(offset);
+            let start_position = buffer.offset_to_position(start_offset);
+            let position = buffer.offset_to_position(offset);
+            (start_position, position)
+        });
+        let scope = window_tab_data.scope;
+        let update_implementation = create_ext_action(self.scope, {
+            let window_tab_data = window_tab_data.clone();
+            move |result| {
+                if let Ok(ProxyResponse::ReferencesResolveResponse { items }) =
+                    result
+                {
+                    window_tab_data
+                        .main_split
+                        .references
+                        .update(|x| *x = init_implementation_root(items, scope));
+                    window_tab_data.show_panel(PanelKind::References);
+                }
+            }
+        });
+        let proxy = self.common.proxy.clone();
+        self.common.proxy.get_references(
+            path,
+            position,
+            create_ext_action(self.scope, move |result| {
+                if let Ok(ProxyResponse::GetReferencesResponse { references }) =
+                    result
+                {
+                    {
+                        if !references.is_empty() {
+                            proxy.references_resolve(
+                                references,
+                                update_implementation,
+                            );
+                        } else {
+                            window_tab_data.show_panel(PanelKind::References);
+                        }
+                    }
+                }
+            }),
+        );
+    }
+
+    pub fn go_to_implementation(&self, window_tab_data: WindowTabData) {
+        let doc = self.doc();
+        let path = match if doc.loaded() {
+            doc.content.with_untracked(|c| c.path().cloned())
+        } else {
+            None
+        } {
+            Some(path) => path,
+            None => return,
+        };
+
+        let offset = self.cursor().with_untracked(|c| c.offset());
+        let (_start_position, position) = doc.buffer.with_untracked(|buffer| {
+            let start_offset = buffer.prev_code_boundary(offset);
+            let start_position = buffer.offset_to_position(start_offset);
+            let position = buffer.offset_to_position(offset);
+            (start_position, position)
+        });
+        let scope = window_tab_data.scope;
+        let update_implementation = create_ext_action(self.scope, {
+            let window_tab_data = window_tab_data.clone();
+            move |result| {
+                if let Ok(ProxyResponse::ReferencesResolveResponse { items }) =
+                    result
+                {
+                    window_tab_data
+                        .main_split
+                        .implementations
+                        .update(|x| *x = init_implementation_root(items, scope));
+                    window_tab_data.show_panel(PanelKind::Implementation);
+                }
+            }
+        });
+        let proxy = self.common.proxy.clone();
+        self.common.proxy.go_to_implementation(
+            path,
+            position,
+            create_ext_action(self.scope, {
+                move |result| {
+                    if let Ok(ProxyResponse::GotoImplementationResponse {
+                        resp,
+                        ..
+                    }) = result
+                    {
+                        let locations = map_to_location(resp);
+                        if !locations.is_empty() {
+                            proxy.references_resolve(
+                                locations,
+                                update_implementation,
+                            );
+                        } else {
+                            window_tab_data.show_panel(PanelKind::Implementation);
+                        }
+                    }
+                }
+            }),
+        );
+    }
+
     fn scroll(&self, down: bool, count: usize, mods: Modifiers) {
         self.editor.scroll(
             self.sticky_header_height.get_untracked(),
@@ -1279,7 +1569,9 @@ impl EditorData {
             return;
         };
 
-        let _ = item.apply(self, start_offset);
+        if let Err(err) = item.apply(self, start_offset) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn next_inline_completion(&self) {
@@ -1310,7 +1602,7 @@ impl EditorData {
         });
     }
 
-    fn cancel_inline_completion(&self) {
+    pub fn cancel_inline_completion(&self) {
         if self
             .common
             .inline_completion
@@ -1419,7 +1711,7 @@ impl EditorData {
         })
     }
 
-    fn select_completion(&self) {
+    pub fn select_completion(&self) {
         let item = self
             .common
             .completion
@@ -1445,7 +1737,9 @@ impl EditorData {
                     {
                         return;
                     }
-                    let _ = editor.apply_completion_item(&item);
+                    if let Err(err) = editor.apply_completion_item(&item) {
+                        tracing::error!("{:?}", err);
+                    }
                 });
                 self.common.proxy.completion_resolve(
                     item.plugin_id,
@@ -1463,8 +1757,8 @@ impl EditorData {
                         send(item);
                     },
                 );
-            } else {
-                let _ = self.apply_completion_item(&item.item);
+            } else if let Err(err) = self.apply_completion_item(&item.item) {
+                tracing::error!("{:?}", err);
             }
         }
     }
@@ -1565,9 +1859,9 @@ impl EditorData {
 
         let doc = self.doc();
         self.common.completion.update(|completion| {
-            completion.path = path.clone();
+            completion.path.clone_from(&path);
             completion.offset = start_offset;
-            completion.input = input.clone();
+            completion.input.clone_from(&input);
             completion.status = CompletionStatus::Started;
             completion.input_items.clear();
             completion.request_id += 1;
@@ -1945,7 +2239,7 @@ impl EditorData {
 
         // insert some empty data, so that we won't make the request again
         doc.code_actions().update(|c| {
-            c.insert(offset, Arc::new((PluginId(0), Vec::new())));
+            c.insert(offset, (PluginId(0), im::Vector::new()));
         });
 
         let (position, rev, diagnostics) = doc.buffer.with_untracked(|buffer| {
@@ -1956,27 +2250,27 @@ impl EditorData {
             // what code actions are available (such as fixes for the diagnostics).
             let diagnostics = doc
                 .diagnostics()
-                .diagnostics
+                .diagnostics_span
                 .get_untracked()
-                .iter()
-                .map(|x| &x.diagnostic)
-                .filter(|x| {
-                    x.range.start.line <= position.line
-                        && x.range.end.line >= position.line
-                })
+                .iter_chunks(offset..offset)
+                .filter(|(iv, _diag)| iv.start <= offset && iv.end >= offset)
+                .map(|(_iv, diag)| diag)
                 .cloned()
                 .collect();
 
             (position, rev, diagnostics)
         });
 
-        let send = create_ext_action(self.scope, move |resp| {
-            if doc.rev() == rev {
-                doc.code_actions().update(|c| {
-                    c.insert(offset, Arc::new(resp));
-                });
-            }
-        });
+        let send = create_ext_action(
+            self.scope,
+            move |resp: (PluginId, CodeActionResponse)| {
+                if doc.rev() == rev {
+                    doc.code_actions().update(|c| {
+                        c.insert(offset, (resp.0, resp.1.into()));
+                    });
+                }
+            },
+        );
 
         self.common.proxy.get_code_actions(
             path,
@@ -2000,12 +2294,13 @@ impl EditorData {
         let code_actions = doc
             .code_actions()
             .with_untracked(|c| c.get(&offset).cloned());
-        if let Some(code_actions) = code_actions {
-            if !code_actions.1.is_empty() {
+        if let Some((plugin_id, code_actions)) = code_actions {
+            if !code_actions.is_empty() {
                 self.common.internal_command.send(
                     InternalCommand::ShowCodeActions {
                         offset,
                         mouse_click,
+                        plugin_id,
                         code_actions,
                     },
                 );
@@ -2069,7 +2364,9 @@ impl EditorData {
             let proxy = self.common.proxy.clone();
             std::thread::spawn(move || {
                 proxy.get_document_formatting(path, move |result| {
-                    let _ = tx.send(result);
+                    if let Err(err) = tx.send(result) {
+                        tracing::error!("{:?}", err);
+                    }
                 });
                 let result = rx.recv_timeout(std::time::Duration::from_secs(1));
                 send(result);
@@ -2101,7 +2398,9 @@ impl EditorData {
             let proxy = self.common.proxy.clone();
             std::thread::spawn(move || {
                 proxy.get_document_formatting(path, move |result| {
-                    let _ = tx.send(result);
+                    if let Err(err) = tx.send(result) {
+                        tracing::error!("{:?}", err);
+                    }
                 });
                 let result = rx.recv_timeout(std::time::Duration::from_secs(1));
                 send(result);
@@ -2297,6 +2596,7 @@ impl EditorData {
             });
     }
 
+    #[instrument]
     pub fn word_at_cursor(&self) -> String {
         let doc = self.doc();
         let region = self.cursor().with_untracked(|c| match &c.mode {
@@ -2331,11 +2631,13 @@ impl EditorData {
         }
     }
 
+    #[instrument]
     pub fn clear_search(&self) {
         self.common.find.visual.set(false);
         self.find_focus.set(false);
     }
 
+    #[instrument]
     fn search(&self) {
         let pattern = self.word_at_cursor();
 
@@ -2354,6 +2656,8 @@ impl EditorData {
     }
 
     pub fn pointer_down(&self, pointer_event: &PointerInputEvent) {
+        self.cancel_completion();
+        self.cancel_inline_completion();
         if let Some(editor_tab_id) = self.editor_tab_id.get_untracked() {
             self.common
                 .internal_command
@@ -2371,6 +2675,70 @@ impl EditorData {
             PointerButton::Primary => {
                 self.active().set(true);
                 self.left_click(pointer_event);
+
+                let y =
+                    pointer_event.pos.y - self.editor.viewport.get_untracked().y0;
+                if self.sticky_header_height.get_untracked() > y {
+                    let index = y as usize
+                        / self.common.config.get_untracked().editor.line_height();
+                    if let (Some(path), Some(line)) = (
+                        self.doc().content.get_untracked().path(),
+                        self.sticky_header_info
+                            .get_untracked()
+                            .sticky_lines
+                            .get(index),
+                    ) {
+                        self.common.internal_command.send(
+                            InternalCommand::JumpToLocation {
+                                location: EditorLocation {
+                                    path: path.clone(),
+                                    position: Some(EditorPosition::Line(*line)),
+                                    scroll_offset: None,
+                                    ignore_unconfirmed: true,
+                                    same_editor_tab: false,
+                                },
+                            },
+                        );
+                        return;
+                    }
+                }
+
+                if (cfg!(target_os = "macos") && pointer_event.modifiers.meta())
+                    || (cfg!(not(target_os = "macos"))
+                        && pointer_event.modifiers.control())
+                {
+                    let rs = self.find_hint(pointer_event.pos);
+                    match rs {
+                        FindHintRs::NoMatchBreak
+                        | FindHintRs::NoMatchContinue { .. } => {
+                            self.common.lapce_command.send(LapceCommand {
+                                kind: CommandKind::Focus(
+                                    FocusCommand::GotoDefinition,
+                                ),
+                                data: None,
+                            })
+                        }
+                        FindHintRs::MatchWithoutLocation => {}
+                        FindHintRs::Match(location) => {
+                            let Ok(path) = location.uri.to_file_path() else {
+                                return;
+                            };
+                            self.common.internal_command.send(
+                                InternalCommand::JumpToLocation {
+                                    location: EditorLocation {
+                                        path,
+                                        position: Some(EditorPosition::Position(
+                                            location.range.start,
+                                        )),
+                                        scroll_offset: None,
+                                        ignore_unconfirmed: true,
+                                        same_editor_tab: false,
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
             }
             PointerButton::Secondary => {
                 self.right_click(pointer_event);
@@ -2379,6 +2747,41 @@ impl EditorData {
         }
     }
 
+    fn find_hint(&self, pos: Point) -> FindHintRs {
+        let rs = self.editor.line_col_of_point_with_phantom(pos);
+        let line = rs.0 as u32;
+        let index = rs.1 as u32;
+        self.doc().inlay_hints.with_untracked(|x| {
+            if let Some(hints) = x {
+                let mut pre_len = 0;
+                for hint in hints
+                    .iter()
+                    .filter_map(|(_, hint)| {
+                        if hint.position.line == line {
+                            Some(hint)
+                        } else {
+                            None
+                        }
+                    })
+                    .sorted_by(|pre, next| {
+                        pre.position.character.cmp(&next.position.character)
+                    })
+                {
+                    match find_hint(pre_len, index, hint) {
+                        FindHintRs::NoMatchContinue { pre_hint_len } => {
+                            pre_len = pre_hint_len;
+                        }
+                        rs => return rs,
+                    }
+                }
+                FindHintRs::NoMatchBreak
+            } else {
+                FindHintRs::NoMatchBreak
+            }
+        })
+    }
+
+    #[instrument]
     fn left_click(&self, pointer_event: &PointerInputEvent) {
         match pointer_event.count {
             1 => {
@@ -2394,18 +2797,22 @@ impl EditorData {
         }
     }
 
+    #[instrument]
     fn single_click(&self, pointer_event: &PointerInputEvent) {
         self.editor.single_click(pointer_event);
     }
 
+    #[instrument]
     fn double_click(&self, pointer_event: &PointerInputEvent) {
         self.editor.double_click(pointer_event);
     }
 
+    #[instrument]
     fn triple_click(&self, pointer_event: &PointerInputEvent) {
         self.editor.triple_click(pointer_event);
     }
 
+    #[instrument]
     pub fn pointer_move(&self, pointer_event: &PointerMoveEvent) {
         let mode = self.cursor().with_untracked(|c| c.get_mode());
         let (offset, is_inside) =
@@ -2457,14 +2864,17 @@ impl EditorData {
         }
     }
 
+    #[instrument]
     pub fn pointer_up(&self, pointer_event: &PointerInputEvent) {
         self.editor.pointer_up(pointer_event);
     }
 
+    #[instrument]
     pub fn pointer_leave(&self) {
         self.common.mouse_hover_timer.set(TimerToken::INVALID);
     }
 
+    #[instrument]
     fn right_click(&self, pointer_event: &PointerInputEvent) {
         let mode = self.cursor().with_untracked(|c| c.get_mode());
         let (offset, _) = self.editor.offset_of_point(mode, pointer_event.pos);
@@ -2478,23 +2888,81 @@ impl EditorData {
             self.single_click(pointer_event);
         }
 
-        let is_file = doc.content.with_untracked(|content| content.is_file());
+        let (path, is_file) = doc.content.with_untracked(|content| match content {
+            DocContent::File { path, .. } => {
+                (Some(path.to_path_buf()), path.is_file())
+            }
+            DocContent::Local
+            | DocContent::History(_)
+            | DocContent::Scratch { .. } => (None, false),
+        });
         let mut menu = Menu::new("");
-        let cmds = if is_file {
-            vec![
-                Some(CommandKind::Focus(FocusCommand::GotoDefinition)),
-                Some(CommandKind::Focus(FocusCommand::GotoTypeDefinition)),
-                None,
-                Some(CommandKind::Focus(FocusCommand::Rename)),
-                None,
-                Some(CommandKind::Edit(EditCommand::ClipboardCut)),
-                Some(CommandKind::Edit(EditCommand::ClipboardCopy)),
-                Some(CommandKind::Edit(EditCommand::ClipboardPaste)),
-                None,
-                Some(CommandKind::Workbench(
-                    LapceWorkbenchCommand::PaletteCommand,
-                )),
-            ]
+        let mut cmds = if is_file {
+            if path
+                .as_ref()
+                .and_then(|x| x.file_name().and_then(|x| x.to_str()))
+                .map(|x| x == "run.toml")
+                .unwrap_or_default()
+            {
+                vec![
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::RevealInPanel,
+                    )),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::RevealInFileExplorer,
+                    )),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::SourceControlOpenActiveFileRemoteUrl,
+                    )),
+                    None,
+                    Some(CommandKind::Edit(EditCommand::ClipboardCut)),
+                    Some(CommandKind::Edit(EditCommand::ClipboardCopy)),
+                    Some(CommandKind::Edit(EditCommand::ClipboardPaste)),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::AddRunDebugConfig,
+                    )),
+                    None,
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::PaletteCommand,
+                    )),
+                ]
+            } else {
+                vec![
+                    Some(CommandKind::Focus(FocusCommand::GotoDefinition)),
+                    Some(CommandKind::Focus(FocusCommand::GotoTypeDefinition)),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::ShowCallHierarchy,
+                    )),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::FindReferences,
+                    )),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::GoToImplementation,
+                    )),
+                    Some(CommandKind::Focus(FocusCommand::Rename)),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::RunInTerminal,
+                    )),
+                    None,
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::RevealInPanel,
+                    )),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::RevealInFileExplorer,
+                    )),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::SourceControlOpenActiveFileRemoteUrl,
+                    )),
+                    None,
+                    Some(CommandKind::Edit(EditCommand::ClipboardCut)),
+                    Some(CommandKind::Edit(EditCommand::ClipboardCopy)),
+                    Some(CommandKind::Edit(EditCommand::ClipboardPaste)),
+                    None,
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::PaletteCommand,
+                    )),
+                ]
+            }
         } else {
             vec![
                 Some(CommandKind::Edit(EditCommand::ClipboardCut)),
@@ -2506,6 +2974,11 @@ impl EditorData {
                 )),
             ]
         };
+        if self.diff_editor_id.get_untracked().is_some() && is_file {
+            cmds.push(Some(CommandKind::Workbench(
+                LapceWorkbenchCommand::GoToLocation,
+            )));
+        }
         let lapce_command = self.common.lapce_command;
         for cmd in cmds {
             if let Some(cmd) = cmd {
@@ -2526,6 +2999,7 @@ impl EditorData {
         show_context_menu(menu, None);
     }
 
+    #[instrument]
     fn update_hover(&self, offset: usize) {
         let doc = self.doc();
         let path = doc
@@ -2562,6 +3036,201 @@ impl EditorData {
         self.cursor()
             .update(|cursor| cursor.set_offset(0, false, false));
     }
+
+    pub fn visual_line(&self, line: usize) -> usize {
+        self.kind.with_untracked(|kind| match kind {
+            EditorViewKind::Normal => line,
+            EditorViewKind::Diff(diff) => {
+                let is_right = diff.is_right;
+                let mut last_change: Option<&DiffLines> = None;
+                let mut visual_line = 0;
+                let mut changes = diff.changes.iter().peekable();
+                while let Some(change) = changes.next() {
+                    match (is_right, change) {
+                        (true, DiffLines::Left(range)) => {
+                            if let Some(DiffLines::Right(_)) = changes.peek() {
+                            } else {
+                                visual_line += range.len();
+                            }
+                        }
+                        (false, DiffLines::Right(range)) => {
+                            let len = if let Some(DiffLines::Left(r)) = last_change {
+                                range.len() - r.len().min(range.len())
+                            } else {
+                                range.len()
+                            };
+                            if len > 0 {
+                                visual_line += len;
+                            }
+                        }
+                        (true, DiffLines::Right(range))
+                        | (false, DiffLines::Left(range)) => {
+                            if line < range.end {
+                                return visual_line + line - range.start;
+                            }
+                            visual_line += range.len();
+                            if is_right {
+                                if let Some(DiffLines::Left(r)) = last_change {
+                                    let len = r.len() - r.len().min(range.len());
+                                    if len > 0 {
+                                        visual_line += len;
+                                    }
+                                }
+                            }
+                        }
+                        (_, DiffLines::Both(info)) => {
+                            let end = if is_right {
+                                info.right.end
+                            } else {
+                                info.left.end
+                            };
+                            if line >= end {
+                                visual_line += info.right.len()
+                                    - info
+                                        .skip
+                                        .as_ref()
+                                        .map(|skip| skip.len().saturating_sub(1))
+                                        .unwrap_or(0);
+                                last_change = Some(change);
+                                continue;
+                            }
+
+                            let start = if is_right {
+                                info.right.start
+                            } else {
+                                info.left.start
+                            };
+                            if let Some(skip) = info.skip.as_ref() {
+                                if start + skip.start > line {
+                                    return visual_line + line - start;
+                                } else if start + skip.end > line {
+                                    return visual_line + skip.start;
+                                } else {
+                                    return visual_line
+                                        + (line - start - skip.len() + 1);
+                                }
+                            } else {
+                                return visual_line + line - start;
+                            }
+                        }
+                    }
+                    last_change = Some(change);
+                }
+                visual_line
+            }
+        })
+    }
+
+    pub fn actual_line(&self, visual_line: usize, bottom_affinity: bool) -> usize {
+        self.kind.with_untracked(|kind| match kind {
+            EditorViewKind::Normal => visual_line,
+            EditorViewKind::Diff(diff) => {
+                let is_right = diff.is_right;
+                let mut actual_line: usize = 0;
+                let mut current_visual_line = 0;
+                let mut last_change: Option<&DiffLines> = None;
+                let mut changes = diff.changes.iter().peekable();
+                while let Some(change) = changes.next() {
+                    match (is_right, change) {
+                        (true, DiffLines::Left(range)) => {
+                            if let Some(DiffLines::Right(_)) = changes.peek() {
+                            } else {
+                                current_visual_line += range.len();
+                                if current_visual_line >= visual_line {
+                                    return if bottom_affinity {
+                                        actual_line
+                                    } else {
+                                        actual_line.saturating_sub(1)
+                                    };
+                                }
+                            }
+                        }
+                        (false, DiffLines::Right(range)) => {
+                            let len = if let Some(DiffLines::Left(r)) = last_change {
+                                range.len() - r.len().min(range.len())
+                            } else {
+                                range.len()
+                            };
+                            if len > 0 {
+                                current_visual_line += len;
+                                if current_visual_line >= visual_line {
+                                    return actual_line;
+                                }
+                            }
+                        }
+                        (true, DiffLines::Right(range))
+                        | (false, DiffLines::Left(range)) => {
+                            let len = range.len();
+                            if current_visual_line + len > visual_line {
+                                return range.start
+                                    + (visual_line - current_visual_line);
+                            }
+                            current_visual_line += len;
+                            actual_line += len;
+                            if is_right {
+                                if let Some(DiffLines::Left(r)) = last_change {
+                                    let len = r.len() - r.len().min(range.len());
+                                    if len > 0 {
+                                        current_visual_line += len;
+                                        if current_visual_line > visual_line {
+                                            return if bottom_affinity {
+                                                actual_line
+                                            } else {
+                                                actual_line - range.len()
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        (_, DiffLines::Both(info)) => {
+                            let len = info.right.len();
+                            let start = if is_right {
+                                info.right.start
+                            } else {
+                                info.left.start
+                            };
+
+                            if let Some(skip) = info.skip.as_ref() {
+                                if current_visual_line + skip.start == visual_line {
+                                    return if bottom_affinity {
+                                        actual_line + skip.end
+                                    } else {
+                                        (actual_line + skip.start).saturating_sub(1)
+                                    };
+                                } else if current_visual_line + skip.start + 1
+                                    > visual_line
+                                {
+                                    return actual_line + visual_line
+                                        - current_visual_line;
+                                } else if current_visual_line + len - skip.len() + 1
+                                    >= visual_line
+                                {
+                                    return actual_line
+                                        + skip.end
+                                        + (visual_line
+                                            - current_visual_line
+                                            - skip.start
+                                            - 1);
+                                }
+                                actual_line += len;
+                                current_visual_line += len - skip.len() + 1;
+                            } else {
+                                if current_visual_line + len > visual_line {
+                                    return start
+                                        + (visual_line - current_visual_line);
+                                }
+                                current_visual_line += len;
+                                actual_line += len;
+                            }
+                        }
+                    }
+                    last_change = Some(change);
+                }
+                actual_line
+            }
+        })
+    }
 }
 
 impl KeyPressFocus for EditorData {
@@ -2574,6 +3243,7 @@ impl KeyPressFocus for EditorData {
         }
     }
 
+    #[instrument]
     fn check_condition(&self, condition: Condition) -> bool {
         match condition {
             Condition::InputFocus => {
@@ -2583,6 +3253,9 @@ impl KeyPressFocus for EditorData {
             Condition::ListFocus => self.has_completions(),
             Condition::CompletionFocus => self.has_completions(),
             Condition::InlineCompletionVisible => self.has_inline_completions(),
+            Condition::OnScreenFindActive => {
+                self.on_screen_find.with_untracked(|f| f.active)
+            }
             Condition::InSnippet => self.snippet.with_untracked(|s| s.is_some()),
             Condition::EditorFocus => self
                 .doc()
@@ -2611,6 +3284,7 @@ impl KeyPressFocus for EditorData {
         }
     }
 
+    #[instrument]
     fn run_command(
         &self,
         command: &crate::command::LapceCommand,
@@ -2688,6 +3362,7 @@ impl KeyPressFocus for EditorData {
             false
         } else {
             self.inline_find.with_untracked(|f| f.is_some())
+                || self.on_screen_find.with_untracked(|f| f.active)
         }
     }
 
@@ -2733,6 +3408,12 @@ impl KeyPressFocus for EditorData {
                 self.inline_find(direction.clone(), c);
                 self.last_inline_find.set(Some((direction, c.to_string())));
                 self.inline_find.set(None);
+            } else if self.on_screen_find.with_untracked(|f| f.active) {
+                self.on_screen_find.update(|find| {
+                    let pattern = format!("{}{c}", find.pattern);
+                    find.regions = self.on_screen_find(&pattern);
+                    find.pattern = pattern;
+                });
             }
         }
     }
@@ -2861,13 +3542,6 @@ pub(crate) fn compute_screen_lines(
             .iter_vlines(text_prov.clone(), false, min_vline)
             .next()
     });
-    // TODO: if you need the max vline you probably need the min vline too and so you could grab
-    // both in one iter call, which would be more efficient than two iterations
-    let max_info = once_cell::sync::Lazy::new(|| {
-        lines
-            .iter_vlines(text_prov.clone(), false, max_vline)
-            .next()
-    });
 
     match view_kind.get() {
         EditorViewKind::Normal => {
@@ -2886,20 +3560,31 @@ pub(crate) fn compute_screen_lines(
             // TODO: the original was min_line..max_line + 1, are we iterating too little now?
             // the iterator is from min_vline..max_vline
             let count = max_vline.get() - min_vline.get();
-            let iter = lines
-                .iter_rvlines_init(
-                    text_prov,
-                    cache_rev,
-                    config_id,
-                    min_info.rvline,
-                    false,
-                )
-                .take(count);
+            let iter = lines.iter_rvlines_init(
+                text_prov,
+                cache_rev,
+                config_id,
+                min_info.rvline,
+                false,
+            );
 
-            for (i, vline_info) in iter.enumerate() {
+            let range = doc.folding_ranges.get().get_folded_range();
+            let mut init_index = 0;
+
+            for vline_info in iter {
+                if rvlines.len() >= count {
+                    break;
+                }
+
+                let (folded, next_index) =
+                    range.contain_line(init_index, vline_info.rvline.line as u32);
+                init_index = next_index;
+                if folded {
+                    continue;
+                }
                 rvlines.push(vline_info.rvline);
 
-                let y_idx = min_vline.get() + i;
+                let y_idx = min_vline.get() + rvlines.len();
                 let vline_y = y_idx * line_height;
                 let line_y = vline_y - vline_info.rvline.line_index * line_height;
 
@@ -2935,7 +3620,7 @@ pub(crate) fn compute_screen_lines(
             let is_right = diff_info.is_right;
 
             let line_y = |info: VLineInfo<()>, vline_y: usize| -> usize {
-                vline_y - info.rvline.line_index * line_height
+                vline_y.saturating_sub(info.rvline.line_index * line_height)
             };
 
             while let Some(change) = changes.next() {
@@ -3005,30 +3690,26 @@ pub(crate) fn compute_screen_lines(
                             continue;
                         }
 
-                        let Some(min_info) = *min_info else {
-                            // TODO(minor): What is the proper behavior here?
-                            break;
-                        };
-
-                        let Some(max_info) = *max_info else {
-                            // TODO(minor): What is the proper behavior here?
-                            break;
-                        };
-
                         let start_rvline =
                             lines.rvline_of_line(&text_prov, range.start);
 
                         // TODO: this wouldn't need to produce vlines if screen lines didn't
                         // require them.
                         let iter = lines
-                            .iter_rvlines(&text_prov, false, start_rvline)
+                            .iter_rvlines_init(
+                                &text_prov,
+                                cache_rev,
+                                config_id,
+                                start_rvline,
+                                false,
+                            )
                             .take_while(|vline_info| {
                                 vline_info.rvline.line < range.end
                             })
                             .enumerate();
                         for (i, rvline_info) in iter {
                             let rvline = rvline_info.rvline;
-                            if rvline < min_info.rvline {
+                            if initial_y_idx + i < min_vline.0 {
                                 continue;
                             }
 
@@ -3043,7 +3724,7 @@ pub(crate) fn compute_screen_lines(
                                 },
                             );
 
-                            if rvline > max_info.rvline {
+                            if initial_y_idx + i > max_vline.0 {
                                 break;
                             }
                         }
@@ -3100,9 +3781,10 @@ pub(crate) fn compute_screen_lines(
                             if let Some(skip) = bothinfo.skip.as_ref() {
                                 if Some(skip.start) == line.checked_sub(start) {
                                     y_idx += 1;
-                                    // Skip by `skip` count, which is skip - 1 because we will
-                                    // go to the next vline on the next iter
-                                    let _ = iter.nth(skip.len().saturating_sub(1));
+                                    // Skip by `skip` count
+                                    for _ in 0..skip.len().saturating_sub(1) {
+                                        iter.next();
+                                    }
                                     continue;
                                 }
                             }
@@ -3147,10 +3829,10 @@ fn parse_hover_resp(
 ) -> Vec<MarkdownContent> {
     match hover.contents {
         HoverContents::Scalar(text) => match text {
-            MarkedString::String(text) => parse_markdown(&text, 1.5, config),
+            MarkedString::String(text) => parse_markdown(&text, 1.8, config),
             MarkedString::LanguageString(code) => parse_markdown(
                 &format!("```{}\n{}\n```", code.language, code.value),
-                1.5,
+                1.8,
                 config,
             ),
         },
@@ -3165,8 +3847,52 @@ fn parse_hover_resp(
             })
             .unwrap_or_default(),
         HoverContents::Markup(content) => match content.kind {
-            MarkupKind::PlainText => from_plaintext(&content.value, 1.5, config),
-            MarkupKind::Markdown => parse_markdown(&content.value, 1.5, config),
+            MarkupKind::PlainText => from_plaintext(&content.value, 1.8, config),
+            MarkupKind::Markdown => parse_markdown(&content.value, 1.8, config),
         },
+    }
+}
+
+#[derive(Debug)]
+enum FindHintRs {
+    NoMatchBreak,
+    NoMatchContinue { pre_hint_len: u32 },
+    MatchWithoutLocation,
+    Match(Location),
+}
+
+fn find_hint(mut pre_hint_len: u32, index: u32, hint: &InlayHint) -> FindHintRs {
+    use FindHintRs::*;
+    match &hint.label {
+        InlayHintLabel::String(text) => {
+            let actual_col = pre_hint_len + hint.position.character;
+            let actual_col_end = actual_col + (text.len() as u32);
+            if actual_col > index {
+                NoMatchBreak
+            } else if actual_col <= index && index < actual_col_end {
+                MatchWithoutLocation
+            } else {
+                pre_hint_len += text.len() as u32;
+                NoMatchContinue { pre_hint_len }
+            }
+        }
+        InlayHintLabel::LabelParts(parts) => {
+            for part in parts {
+                let actual_col = pre_hint_len + hint.position.character;
+                let actual_col_end = actual_col + part.value.len() as u32;
+                if index < actual_col {
+                    return NoMatchBreak;
+                } else if actual_col <= index && index < actual_col_end {
+                    if let Some(location) = &part.location {
+                        return Match(location.clone());
+                    } else {
+                        return MatchWithoutLocation;
+                    }
+                } else {
+                    pre_hint_len += part.value.len() as u32;
+                }
+            }
+            NoMatchContinue { pre_hint_len }
+        }
     }
 }

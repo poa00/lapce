@@ -1,5 +1,5 @@
 variable "RUST_VERSION" {
-  default = "1.76"
+  default = "1"
 }
 
 variable "XX_VERSION" {
@@ -129,13 +129,11 @@ target "ubuntu" {
   matrix = {
     os_name = ["ubuntu"]
     build = [
-      { packages = null, platforms = null, type = "package", os_version = "bionic"  }, # 18.04
-      { packages = null, platforms = null, type = "package", os_version = "focal"   }, # 20.04
-      { packages = null, platforms = null, type = "package", os_version = "jammy"   }, # 22.04
-      { packages = null, platforms = null, type = "package", os_version = "kinetic" }, # 22.10
-      { packages = null, platforms = null, type = "package", os_version = "lunar"   }, # 23.04
-      { packages = null, platforms = null, type = "package", os_version = "mantic"  }, # 23.10
-      { packages = null, platforms = null, type = "package", os_version = "noble"   }, # 24.04
+      { packages = null, platforms = null, type = "package", os_version = "bionic"   }, # 18.04
+      { packages = null, platforms = null, type = "package", os_version = "focal"    }, # 20.04
+      { packages = null, platforms = null, type = "package", os_version = "jammy"    }, # 22.04
+      { packages = null, platforms = null, type = "package", os_version = "noble"    }, # 24.04
+      { packages = null, platforms = null, type = "package", os_version = "oracular" }, # 24.10
       # static binary, it looks ugly to define the target this way
       # but I don't have a better way to make it more friendly on CLI side without
       # more terrible code-wise way to implement it
@@ -160,24 +158,25 @@ variable "RHEL_FAMILY_PACKAGES" {
 }
 
 target "fedora" {
-  inherits   = ["package"]
-  name       = "${os_name}-${build.os_version}"
-  dockerfile = "extra/linux/docker/${os_name}/Dockerfile"
+  inherits   = [build.type]
+  name       = "${name}-${build.version}-${build.type}"
+  dockerfile = "extra/linux/docker/${name}/Dockerfile"
   args = {
     XX_VERSION = "test"
 
-    DISTRIBUTION_NAME     = os_name
-    DISTRIBUTION_VERSION  = build.os_version
+    DISTRIBUTION_NAME     = name
+    DISTRIBUTION_VERSION  = build.version
     DISTRIBUTION_PACKAGES = join(" ", coalesce(build.packages, RHEL_FAMILY_PACKAGES))
   }
-  platforms = coalesce(build.platforms, platforms)
+  // platforms = coalesce(build.platforms, platforms)
+  platforms = ["linux/amd64"]
   matrix = {
-    os_name = ["fedora"]
+    name = ["fedora"]
     build = [
-      { os_version = "39",      packages = null, platforms = null },
-      { os_version = "40",      packages = null, platforms = null },
-      { os_version = "41",      packages = null, platforms = null },
-      { os_version = "rawhide", packages = null, platforms = null },
+      { packages = null, platforms = null, type = "package", version = "39" },
+      { packages = null, platforms = null, type = "package", version = "40" },
+      { packages = null, platforms = null, type = "package", version = "41" },
+      { packages = null, platforms = null, type = "package", version = "rawhide" },
     ]
   }
 }
@@ -194,6 +193,7 @@ variable "APK_FAMILY_PACKAGES" {
     "lld",
     "build-base",
     "rustup",
+    "openssl-dev",
     "openssl-libs-static",
     "libssh2-static",
     "libgit2-static",
@@ -221,11 +221,19 @@ target "alpine" {
   matrix = {
     os_name = ["alpine"]
     build = [
+      { os_version = "3.20", packages = null, platforms = null },
       { os_version = "3.18", packages = null, platforms = null },
     ]
   }
 }
 
 target "cross-alpine" {
-  inherits = ["alpine-3-18", "cross-binary"]
+  inherits = ["alpine-3-20", "cross-binary"]
+}
+
+target "alpine-dev" {
+  inherits = ["alpine-3-20"]
+  target   = "dev"
+  tags     = ["lapce/lapce:dev"]
+  output   = ["type=docker"]
 }

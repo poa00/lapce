@@ -13,15 +13,18 @@ use std::{
 use alacritty_terminal::{event::WindowSize, event_loop::Msg};
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
-use git2::ErrorCode::NotFound;
-use git2::{build::CheckoutBuilder, DiffOptions, Oid, Repository};
+use git2::{
+    build::CheckoutBuilder, DiffOptions, ErrorCode::NotFound, Oid, Repository,
+};
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks::UTF8, SearcherBuilder};
 use indexmap::IndexMap;
 use lapce_rpc::{
-    core::{CoreNotification, CoreRpcHandler},
+    buffer::BufferId,
+    core::{CoreNotification, CoreRpcHandler, FileChanged},
     file::FileNodeItem,
+    file_line::FileLine,
     proxy::{
         ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse,
         ProxyRpcHandler, SearchMatch,
@@ -33,7 +36,9 @@ use lapce_rpc::{
 };
 use lapce_xi_rope::Rope;
 use lsp_types::{
-    MessageType, Position, Range, ShowMessageParams, TextDocumentItem, Url,
+    notification::{Cancel, Notification},
+    CancelParams, MessageType, NumberOrString, Position, Range, ShowMessageParams,
+    TextDocumentItem, Url,
 };
 use parking_lot::Mutex;
 
@@ -112,13 +117,26 @@ impl ProxyHandler for Dispatcher {
                     .notification(CoreNotification::OpenPaths { paths });
             }
             OpenFileChanged { path } => {
-                if let Some(buffer) = self.buffers.get(&path) {
-                    if get_mod_time(&buffer.path) == buffer.mod_time {
-                        return;
+                if path.exists() {
+                    if let Some(buffer) = self.buffers.get(&path) {
+                        if get_mod_time(&buffer.path) == buffer.mod_time {
+                            return;
+                        }
+                        match load_file(&buffer.path) {
+                            Ok(content) => {
+                                self.core_rpc.open_file_changed(
+                                    path,
+                                    FileChanged::Change(content),
+                                );
+                            }
+                            Err(err) => {
+                                tracing::event!(tracing::Level::ERROR, "Failed to re-read file after change notification: {err}");
+                            }
+                        }
                     }
-                    if let Ok(content) = load_file(&buffer.path) {
-                        self.core_rpc.open_file_changed(path, content);
-                    }
+                } else {
+                    self.buffers.remove(&path);
+                    self.core_rpc.open_file_changed(path, FileChanged::Delete);
                 }
             }
             Completion {
@@ -157,7 +175,9 @@ impl ProxyHandler for Dispatcher {
                 );
             }
             UpdatePluginConfigs { configs } => {
-                let _ = self.catalog_rpc.update_plugin_configs(configs);
+                if let Err(err) = self.catalog_rpc.update_plugin_configs(configs) {
+                    tracing::error!("{:?}", err);
+                }
             }
             NewTerminal { term_id, profile } => {
                 let mut terminal = match Terminal::new(term_id, profile, 50, 10) {
@@ -171,12 +191,12 @@ impl ProxyHandler for Dispatcher {
                 #[allow(unused)]
                 let mut child_id = None;
 
+                #[cfg(target_os = "windows")]
+                {
+                    child_id = terminal.pty.child_watcher().pid().map(|x| x.get());
+                }
                 #[cfg(not(target_os = "windows"))]
                 {
-                    // Alacritty currently doesn't expose the child process ID on windows, so this won't compile
-                    // Alacritty does acquire this information, but it is discarded
-                    // This is currently only used for debug adapter protocol's RunInTerminal request, which we
-                    // specify isn't supported on Windows at the moment
                     child_id = Some(terminal.pty.child().id());
                 }
 
@@ -220,57 +240,86 @@ impl ProxyHandler for Dispatcher {
                 config,
                 breakpoints,
             } => {
-                let _ = self.catalog_rpc.dap_start(config, breakpoints);
+                if let Err(err) = self.catalog_rpc.dap_start(config, breakpoints) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapProcessId {
                 dap_id,
                 process_id,
                 term_id,
             } => {
-                let _ = self.catalog_rpc.dap_process_id(dap_id, process_id, term_id);
+                if let Err(err) =
+                    self.catalog_rpc.dap_process_id(dap_id, process_id, term_id)
+                {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapContinue { dap_id, thread_id } => {
-                let _ = self.catalog_rpc.dap_continue(dap_id, thread_id);
+                if let Err(err) = self.catalog_rpc.dap_continue(dap_id, thread_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapPause { dap_id, thread_id } => {
-                let _ = self.catalog_rpc.dap_pause(dap_id, thread_id);
+                if let Err(err) = self.catalog_rpc.dap_pause(dap_id, thread_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapStepOver { dap_id, thread_id } => {
-                let _ = self.catalog_rpc.dap_step_over(dap_id, thread_id);
+                if let Err(err) = self.catalog_rpc.dap_step_over(dap_id, thread_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapStepInto { dap_id, thread_id } => {
-                let _ = self.catalog_rpc.dap_step_into(dap_id, thread_id);
+                if let Err(err) = self.catalog_rpc.dap_step_into(dap_id, thread_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapStepOut { dap_id, thread_id } => {
-                let _ = self.catalog_rpc.dap_step_out(dap_id, thread_id);
+                if let Err(err) = self.catalog_rpc.dap_step_out(dap_id, thread_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapStop { dap_id } => {
-                let _ = self.catalog_rpc.dap_stop(dap_id);
+                if let Err(err) = self.catalog_rpc.dap_stop(dap_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapDisconnect { dap_id } => {
-                let _ = self.catalog_rpc.dap_disconnect(dap_id);
+                if let Err(err) = self.catalog_rpc.dap_disconnect(dap_id) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapRestart {
                 dap_id,
                 breakpoints,
             } => {
-                let _ = self.catalog_rpc.dap_restart(dap_id, breakpoints);
+                if let Err(err) = self.catalog_rpc.dap_restart(dap_id, breakpoints) {
+                    tracing::error!("{:?}", err);
+                }
             }
             DapSetBreakpoints {
                 dap_id,
                 path,
                 breakpoints,
             } => {
-                let _ =
+                if let Err(err) =
                     self.catalog_rpc
-                        .dap_set_breakpoints(dap_id, path, breakpoints);
+                        .dap_set_breakpoints(dap_id, path, breakpoints)
+                {
+                    tracing::error!("{:?}", err);
+                }
             }
             InstallVolt { volt } => {
                 let catalog_rpc = self.catalog_rpc.clone();
-                let _ = catalog_rpc.install_volt(volt);
+                if let Err(err) = catalog_rpc.install_volt(volt) {
+                    tracing::error!("{:?}", err);
+                }
             }
             ReloadVolt { volt } => {
-                let _ = self.catalog_rpc.reload_volt(volt);
+                if let Err(err) = self.catalog_rpc.reload_volt(volt) {
+                    tracing::error!("{:?}", err);
+                }
             }
             RemoveVolt { volt } => {
                 self.catalog_rpc.remove_volt(volt);
@@ -279,7 +328,9 @@ impl ProxyHandler for Dispatcher {
                 self.catalog_rpc.stop_volt(volt);
             }
             EnableVolt { volt } => {
-                let _ = self.catalog_rpc.enable_volt(volt);
+                if let Err(err) = self.catalog_rpc.enable_volt(volt) {
+                    tracing::error!("{:?}", err);
+                }
             }
             GitCommit { message, diffs } => {
                 if let Some(workspace) = self.workspace.as_ref() {
@@ -331,6 +382,18 @@ impl ProxyHandler for Dispatcher {
                         Err(e) => eprintln!("{e:?}"),
                     }
                 }
+            }
+            LspCancel { id } => {
+                self.catalog_rpc.send_notification(
+                    None,
+                    Cancel::METHOD,
+                    CancelParams {
+                        id: NumberOrString::Number(id),
+                    },
+                    None,
+                    None,
+                    false,
+                );
             }
         }
     }
@@ -511,6 +574,35 @@ impl ProxyHandler for Dispatcher {
                                 request_id,
                                 definition,
                             }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
+            }
+            ShowCallHierarchy { path, position } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.show_call_hierarchy(
+                    &path,
+                    position,
+                    move |_, result| {
+                        let result = result.map(|items| {
+                            ProxyResponse::ShowCallHierarchyResponse { items }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
+            }
+            CallHierarchyIncoming {
+                path,
+                call_hierarchy_item,
+            } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.call_hierarchy_incoming(
+                    &path,
+                    call_hierarchy_item,
+                    move |_, result| {
+                        let result = result.map(|items| {
+                            ProxyResponse::CallHierarchyIncomingResponse { items }
                         });
                         proxy_rpc.handle_response(id, result);
                     },
@@ -930,7 +1022,7 @@ impl ProxyHandler for Dispatcher {
                             let buffer = self.buffers.remove(&from);
 
                             if let Some(mut buffer) = buffer {
-                                buffer.path = to.clone();
+                                buffer.path.clone_from(&to);
                                 self.buffers.insert(to.clone(), buffer);
                             }
                         }
@@ -1028,6 +1120,87 @@ impl ProxyHandler for Dispatcher {
                         );
                     });
             }
+            GetCodeLens { path } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc
+                    .get_code_lens(&path, move |plugin_id, result| {
+                        let result = result.map(|resp| {
+                            ProxyResponse::GetCodeLensResponse { plugin_id, resp }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    });
+            }
+            LspFoldingRange { path } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.get_lsp_folding_range(
+                    &path,
+                    move |plugin_id, result| {
+                        let result = result.map(|resp| {
+                            ProxyResponse::LspFoldingRangeResponse {
+                                plugin_id,
+                                resp,
+                            }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
+            }
+            GetCodeLensResolve { code_lens, path } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.get_code_lens_resolve(
+                    &path,
+                    &code_lens,
+                    move |plugin_id, result| {
+                        let result = result.map(|resp| {
+                            ProxyResponse::GetCodeLensResolveResponse {
+                                plugin_id,
+                                resp,
+                            }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
+            }
+            GotoImplementation { path, position } => {
+                let proxy_rpc = self.proxy_rpc.clone();
+                self.catalog_rpc.go_to_implementation(
+                    &path,
+                    position,
+                    move |plugin_id, result| {
+                        let result = result.map(|resp| {
+                            ProxyResponse::GotoImplementationResponse {
+                                plugin_id,
+                                resp,
+                            }
+                        });
+                        proxy_rpc.handle_response(id, result);
+                    },
+                );
+            }
+            ReferencesResolve { items } => {
+                let items: Vec<FileLine> = items
+                    .into_iter()
+                    .filter_map(|location| {
+                        let Ok(path) = location.uri.to_file_path() else {
+                            tracing::error!(
+                                "get file path fail: {:?}",
+                                location.uri
+                            );
+                            return None;
+                        };
+                        let buffer = self.get_buffer_or_insert(path.clone());
+                        let line_num = location.range.start.line as usize;
+                        let content = buffer.line_to_cow(line_num).to_string();
+                        Some(FileLine {
+                            path,
+                            position: location.range.start,
+                            content,
+                        })
+                    })
+                    .collect();
+                let resp = ProxyResponse::ReferencesResolveResponse { items };
+                self.proxy_rpc.handle_response(id, Ok(resp));
+            }
         }
     }
 }
@@ -1054,6 +1227,12 @@ impl Dispatcher {
 
     fn respond_rpc(&self, id: RequestId, result: Result<ProxyResponse, RpcError>) {
         self.proxy_rpc.handle_response(id, result);
+    }
+
+    fn get_buffer_or_insert(&mut self, path: PathBuf) -> &mut Buffer {
+        self.buffers
+            .entry(path.clone())
+            .or_insert(Buffer::new(BufferId::next(), path))
     }
 }
 
@@ -1110,8 +1289,19 @@ impl FileWatchNotifier {
     }
 
     fn handle_open_file_fs_event(&self, event: notify::Event) {
-        if event.kind.is_modify() {
+        if event.kind.is_modify() || event.kind.is_remove() {
             for path in event.paths {
+                #[cfg(windows)]
+                if let Some(path_str) = path.to_str() {
+                    const PREFIX: &str = r"\\?\";
+                    if path_str.starts_with(PREFIX) {
+                        let path = PathBuf::from(&path_str[PREFIX.len()..]);
+                        self.proxy_rpc.notification(
+                            ProxyNotification::OpenFileChanged { path },
+                        );
+                        continue;
+                    }
+                }
                 self.proxy_rpc
                     .notification(ProxyNotification::OpenFileChanged { path });
             }
@@ -1131,14 +1321,18 @@ impl FileWatchNotifier {
         if let Some(sender) = handler.as_mut() {
             if explorer_change {
                 // only send the value if we need to update file explorer as well
-                let _ = sender.send(explorer_change);
+                if let Err(err) = sender.send(explorer_change) {
+                    tracing::error!("{:?}", err);
+                }
             }
             return;
         }
         let (sender, receiver) = crossbeam_channel::unbounded();
         if explorer_change {
             // only send the value if we need to update file explorer as well
-            let _ = sender.send(explorer_change);
+            if let Err(err) = sender.send(explorer_change) {
+                tracing::error!("{:?}", err);
+            }
         }
 
         let local_handler = self.workspace_fs_change_handler.clone();
@@ -1510,7 +1704,7 @@ fn search_in_path(
 
         if path.is_file() {
             let mut line_matches = Vec::new();
-            let _ = searcher.search_path(
+            if let Err(err) = searcher.search_path(
                 &matcher,
                 path.clone(),
                 UTF8(|lnum, line| {
@@ -1549,7 +1743,11 @@ fn search_in_path(
                     });
                     Ok(true)
                 }),
-            );
+            ) {
+                {
+                    tracing::error!("{:?}", err);
+                }
+            }
             if !line_matches.is_empty() {
                 matches.insert(path.clone(), line_matches);
             }

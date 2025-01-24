@@ -48,9 +48,12 @@ impl WrapStyle {
         }
     }
 }
-impl ToString for WrapStyle {
-    fn to_string(&self) -> String {
-        self.as_str().to_string()
+
+impl std::fmt::Display for WrapStyle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())?;
+
+        Ok(())
     }
 }
 
@@ -61,8 +64,8 @@ pub struct EditorConfig {
     pub font_family: String,
     #[field_names(desc = "Set the editor font size")]
     font_size: usize,
-    #[field_names(desc = "Set the font size in the code lens")]
-    pub code_lens_font_size: usize,
+    #[field_names(desc = "Set the font size in the code glance")]
+    pub code_glance_font_size: usize,
     #[field_names(
         desc = "Set the editor line height. If less than 5.0, line height will be a multiple of the font size."
     )]
@@ -93,10 +96,16 @@ pub struct EditorConfig {
         desc = "Show code context like functions and classes at the top of editor when scroll"
     )]
     pub sticky_header: bool,
+    #[field_names(desc = "The number of pixels to show completion")]
+    pub completion_width: usize,
     #[field_names(
         desc = "If the editor should show the documentation of the current completion item"
     )]
     pub completion_show_documentation: bool,
+    #[field_names(
+        desc = "Should the completion item use the `detail` field to replace the label `field`?"
+    )]
+    pub completion_item_show_detail: bool,
     #[field_names(
         desc = "If the editor should show the signature of the function as the parameters are being typed"
     )]
@@ -150,6 +159,11 @@ pub struct EditorConfig {
     pub inlay_hint_font_size: usize,
     #[field_names(desc = "If diagnostics should be displayed inline")]
     pub enable_error_lens: bool,
+
+    #[field_names(
+        desc = "Only render the styling without displaying messages, provided that `Enable ErrorLens` is enabled"
+    )]
+    pub only_render_error_styling: bool,
     #[field_names(
         desc = "Whether error lens should go to the end of view line, or only to the end of the diagnostic"
     )]
@@ -234,7 +248,7 @@ pub struct EditorConfig {
 
 impl EditorConfig {
     pub fn font_size(&self) -> usize {
-        self.font_size.max(6).min(32)
+        self.font_size.clamp(6, 32)
     }
 
     pub fn line_height(&self) -> usize {

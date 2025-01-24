@@ -2,7 +2,7 @@ use std::{path::PathBuf, rc::Rc};
 
 use floem::{
     keyboard::Modifiers,
-    reactive::{RwSignal, Scope},
+    reactive::{RwSignal, Scope, SignalWith},
 };
 use indexmap::IndexMap;
 use lapce_core::mode::Mode;
@@ -16,7 +16,7 @@ use crate::{
     window_tab::CommonData,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SourceControlData {
     // VCS modified files & whether they should be included in the next commit
     pub file_diffs: RwSignal<IndexMap<PathBuf, (FileDiff, bool)>>,

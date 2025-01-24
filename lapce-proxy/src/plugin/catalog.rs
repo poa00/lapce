@@ -9,19 +9,18 @@ use std::{
     thread,
 };
 
-use lapce_rpc::plugin::VoltInfo;
 use lapce_rpc::{
     dap_types::{self, DapId, DapServer, SetBreakpointsResponse},
-    plugin::{PluginId, VoltID, VoltMetadata},
+    plugin::{PluginId, VoltID, VoltInfo, VoltMetadata},
     proxy::ProxyResponse,
     style::LineStyle,
     RpcError,
 };
 use lapce_xi_rope::{Rope, RopeDelta};
-use lsp_types::request::Request;
 use lsp_types::{
-    notification::DidOpenTextDocument, DidOpenTextDocumentParams, SemanticTokens,
-    TextDocumentIdentifier, TextDocumentItem, VersionedTextDocumentIdentifier,
+    notification::DidOpenTextDocument, request::Request, DidOpenTextDocumentParams,
+    MessageType, SemanticTokens, ShowMessageParams, TextDocumentIdentifier,
+    TextDocumentItem, VersionedTextDocumentIdentifier,
 };
 use parking_lot::Mutex;
 use psp_types::Notification;
@@ -208,9 +207,14 @@ impl PluginCatalog {
             if let Some(meta) = self.unactivated_volts.remove(id) {
                 let configurations =
                     self.plugin_configurations.get(&meta.name).cloned();
+                tracing::debug!("{:?} {:?}", id, configurations);
                 let plugin_rpc = self.plugin_rpc.clone();
                 thread::spawn(move || {
-                    let _ = start_volt(workspace, configurations, plugin_rpc, meta);
+                    if let Err(err) =
+                        start_volt(workspace, configurations, plugin_rpc, meta)
+                    {
+                        tracing::error!("{:?}", err);
+                    }
                 });
             }
         }
@@ -243,20 +247,30 @@ impl PluginCatalog {
                     {
                         let mut builder = globset::GlobSetBuilder::new();
                         for glob in globs {
-                            if let Ok(glob) = globset::Glob::new(glob) {
-                                builder.add(glob);
+                            match globset::Glob::new(glob) {
+                                Ok(glob) => {
+                                    builder.add(glob);
+                                }
+                                Err(err) => {
+                                    tracing::error!("{:?}", err);
+                                }
                             }
                         }
-                        if let Ok(matcher) = builder.build() {
-                            if !matcher.is_empty() {
-                                for entry in walkdir::WalkDir::new(workspace)
-                                    .into_iter()
-                                    .flatten()
-                                {
-                                    if matcher.is_match(entry.path()) {
-                                        return Some(id.clone());
+                        match builder.build() {
+                            Ok(matcher) => {
+                                if !matcher.is_empty() {
+                                    for entry in walkdir::WalkDir::new(workspace)
+                                        .into_iter()
+                                        .flatten()
+                                    {
+                                        if matcher.is_match(entry.path()) {
+                                            return Some(id.clone());
+                                        }
                                     }
                                 }
+                            }
+                            Err(err) => {
+                                tracing::error!("{:?}", err);
                             }
                         }
                     }
@@ -269,8 +283,13 @@ impl PluginCatalog {
     }
 
     pub fn handle_did_open_text_document(&mut self, document: TextDocumentItem) {
-        if let Ok(path) = document.uri.to_file_path() {
-            self.open_files.insert(path, document.language_id.clone());
+        match document.uri.to_file_path() {
+            Ok(path) => {
+                self.open_files.insert(path, document.language_id.clone());
+            }
+            Err(err) => {
+                tracing::error!("{:?}", err);
+            }
         }
 
         let to_be_activated: Vec<VoltID> = self
@@ -462,6 +481,7 @@ impl PluginCatalog {
         use PluginCatalogNotification::*;
         match notification {
             UnactivatedVolts(volts) => {
+                tracing::debug!("UnactivatedVolts {:?}", volts);
                 for volt in volts {
                     let id = volt.id();
                     self.unactivated_volts.insert(id, volt);
@@ -469,25 +489,30 @@ impl PluginCatalog {
                 self.check_unactivated_volts();
             }
             UpdatePluginConfigs(configs) => {
+                tracing::debug!("UpdatePluginConfigs {:?}", configs);
                 self.plugin_configurations = configs;
             }
             PluginServerLoaded(plugin) => {
                 // TODO: check if the server has did open registered
-                if let Ok(ProxyResponse::GetOpenFilesContentResponse { items }) =
-                    self.plugin_rpc.proxy_rpc.get_open_files_content()
-                {
-                    for item in items {
-                        let language_id = Some(item.language_id.clone());
-                        let path = item.uri.to_file_path().ok();
-                        plugin.server_notification(
-                            DidOpenTextDocument::METHOD,
-                            DidOpenTextDocumentParams {
-                                text_document: item,
-                            },
-                            language_id,
-                            path,
-                            true,
-                        );
+                match self.plugin_rpc.proxy_rpc.get_open_files_content() {
+                    Ok(ProxyResponse::GetOpenFilesContentResponse { items }) => {
+                        for item in items {
+                            let language_id = Some(item.language_id.clone());
+                            let path = item.uri.to_file_path().ok();
+                            plugin.server_notification(
+                                DidOpenTextDocument::METHOD,
+                                DidOpenTextDocumentParams {
+                                    text_document: item,
+                                },
+                                language_id,
+                                path,
+                                true,
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!("{:?}", err);
                     }
                 }
 
@@ -507,17 +532,22 @@ impl PluginCatalog {
                 }
             }
             InstallVolt(volt) => {
+                tracing::debug!("InstallVolt {:?}", volt);
                 let workspace = self.workspace.clone();
                 let configurations =
                     self.plugin_configurations.get(&volt.name).cloned();
                 let catalog_rpc = self.plugin_rpc.clone();
                 catalog_rpc.stop_volt(volt.clone());
                 thread::spawn(move || {
-                    let _ =
-                        install_volt(catalog_rpc, workspace, configurations, volt);
+                    if let Err(err) =
+                        install_volt(catalog_rpc, workspace, configurations, volt)
+                    {
+                        tracing::error!("{:?}", err);
+                    }
                 });
             }
             ReloadVolt(volt) => {
+                tracing::debug!("ReloadVolt {:?}", volt);
                 let volt_id = volt.id();
                 let ids: Vec<PluginId> = self.plugins.keys().cloned().collect();
                 for id in ids {
@@ -526,9 +556,12 @@ impl PluginCatalog {
                         plugin.shutdown();
                     }
                 }
-                let _ = self.plugin_rpc.unactivated_volts(vec![volt]);
+                if let Err(err) = self.plugin_rpc.unactivated_volts(vec![volt]) {
+                    tracing::error!("{:?}", err);
+                }
             }
             StopVolt(volt) => {
+                tracing::debug!("StopVolt {:?}", volt);
                 let volt_id = volt.id();
                 let ids: Vec<PluginId> = self.plugins.keys().cloned().collect();
                 for id in ids {
@@ -539,6 +572,7 @@ impl PluginCatalog {
                 }
             }
             EnableVolt(volt) => {
+                tracing::debug!("EnableVolt {:?}", volt);
                 let volt_id = volt.id();
                 for (_, volt) in self.plugins.iter() {
                     if volt.volt_id == volt_id {
@@ -547,7 +581,9 @@ impl PluginCatalog {
                 }
                 let plugin_rpc = self.plugin_rpc.clone();
                 thread::spawn(move || {
-                    let _ = enable_volt(plugin_rpc, volt);
+                    if let Err(err) = enable_volt(plugin_rpc, volt) {
+                        tracing::error!("{:?}", err);
+                    }
                 });
             }
             DapLoaded(dap_rpc) => {
@@ -568,7 +604,7 @@ impl PluginCatalog {
                     .and_then(|ty| self.debuggers.get(ty).cloned())
                 {
                     thread::spawn(move || {
-                        if let Ok(dap_rpc) = DapClient::start(
+                        match DapClient::start(
                             DapServer {
                                 program: debugger.program,
                                 args: debugger.args.unwrap_or_default(),
@@ -578,11 +614,30 @@ impl PluginCatalog {
                             breakpoints,
                             plugin_rpc.clone(),
                         ) {
-                            let _ = plugin_rpc.dap_loaded(dap_rpc.clone());
+                            Ok(dap_rpc) => {
+                                if let Err(err) =
+                                    plugin_rpc.dap_loaded(dap_rpc.clone())
+                                {
+                                    tracing::error!("{:?}", err);
+                                }
 
-                            let _ = dap_rpc.launch(&config);
+                                if let Err(err) = dap_rpc.launch(&config) {
+                                    tracing::error!("{:?}", err);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!("{:?}", err);
+                            }
                         }
                     });
+                } else {
+                    self.plugin_rpc.core_rpc.show_message(
+                        "debug fail".to_owned(),
+                        ShowMessageParams {
+                            typ: MessageType::ERROR,
+                            message: "Debugger not found. Please install the appropriate plugin.".to_owned(),
+                        },
+                    )
                 }
             }
             DapProcessId {
@@ -591,7 +646,11 @@ impl PluginCatalog {
                 term_id,
             } => {
                 if let Some(dap) = self.daps.get(&dap_id) {
-                    let _ = dap.termain_process_tx.send((term_id, process_id));
+                    if let Err(err) =
+                        dap.termain_process_tx.send((term_id, process_id))
+                    {
+                        tracing::error!("{:?}", err);
+                    }
                 }
             }
             DapContinue { dap_id, thread_id } => {
@@ -607,7 +666,9 @@ impl PluginCatalog {
             DapPause { dap_id, thread_id } => {
                 if let Some(dap) = self.daps.get(&dap_id).cloned() {
                     thread::spawn(move || {
-                        let _ = dap.pause_thread(thread_id);
+                        if let Err(err) = dap.pause_thread(thread_id) {
+                            tracing::error!("{:?}", err);
+                        }
                     });
                 }
             }
@@ -634,7 +695,9 @@ impl PluginCatalog {
             DapDisconnect { dap_id } => {
                 if let Some(dap) = self.daps.get(&dap_id).cloned() {
                     thread::spawn(move || {
-                        let _ = dap.disconnect();
+                        if let Err(err) = dap.disconnect() {
+                            tracing::error!("{:?}", err);
+                        }
                     });
                 }
             }
@@ -657,12 +720,17 @@ impl PluginCatalog {
                         path.clone(),
                         breakpoints,
                         move |result: Result<SetBreakpointsResponse, RpcError>| {
-                            if let Ok(resp) = result {
-                                core_rpc.dap_breakpoints_resp(
-                                    dap_id,
-                                    path,
-                                    resp.breakpoints.unwrap_or_default(),
-                                );
+                            match result {
+                                Ok(resp) => {
+                                    core_rpc.dap_breakpoints_resp(
+                                        dap_id,
+                                        path,
+                                        resp.breakpoints.unwrap_or_default(),
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::error!("{:?}", err);
+                                }
                             }
                         },
                     );

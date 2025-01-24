@@ -5,6 +5,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use alacritty_terminal::{
@@ -44,8 +45,12 @@ impl TerminalSender {
     }
 
     pub fn send(&self, msg: Msg) {
-        let _ = self.tx.send(msg);
-        let _ = self.poller.notify();
+        if let Err(err) = self.tx.send(msg) {
+            tracing::error!("{:?}", err);
+        }
+        if let Err(err) = self.poller.notify() {
+            tracing::error!("{:?}", err);
+        }
     }
 }
 
@@ -114,9 +119,11 @@ impl Terminal {
         let mut events =
             polling::Events::with_capacity(NonZeroUsize::new(1024).unwrap());
 
+        let timeout = Some(Duration::from_secs(6));
+        let mut exit_code = None;
         'event_loop: loop {
             events.clear();
-            if let Err(err) = self.poller.wait(&mut events, None) {
+            if let Err(err) = self.poller.wait(&mut events, timeout) {
                 match err.kind() {
                     ErrorKind::Interrupted => continue,
                     _ => panic!("EventLoop polling error: {err:?}"),
@@ -131,9 +138,13 @@ impl Terminal {
             for event in events.iter() {
                 match event.key {
                     PTY_CHILD_EVENT_TOKEN => {
-                        if let Some(tty::ChildEvent::Exited(_)) =
+                        if let Some(tty::ChildEvent::Exited(exited_code)) =
                             self.pty.next_child_event()
                         {
+                            if let Err(err) = self.pty_read(&core_rpc, &mut buf) {
+                                tracing::error!("{:?}", err);
+                            }
+                            exit_code = exited_code;
                             break 'event_loop;
                         }
                     }
@@ -189,8 +200,10 @@ impl Terminal {
                     .unwrap();
             }
         }
-        core_rpc.terminal_process_stopped(self.term_id);
-        let _ = self.pty.deregister(&self.poller);
+        core_rpc.terminal_process_stopped(self.term_id, exit_code);
+        if let Err(err) = self.pty.deregister(&self.poller) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     /// Drain the channel.
@@ -267,9 +280,14 @@ impl Terminal {
 
     fn workdir(profile: &TerminalProfile) -> Option<PathBuf> {
         if let Some(cwd) = &profile.workdir {
-            if let Ok(cwd) = cwd.to_file_path() {
-                if cwd.exists() {
-                    return Some(cwd);
+            match cwd.to_file_path() {
+                Ok(cwd) => {
+                    if cwd.exists() {
+                        return Some(cwd);
+                    }
+                }
+                Err(err) => {
+                    tracing::error!("{:?}", err);
                 }
             }
         }

@@ -1,8 +1,14 @@
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Direction, Line, Point};
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::{
-    event::EventListener, term::test::TermSize, vte::ansi, Term,
+    event::EventListener,
+    grid::Dimensions,
+    index::{Column, Direction, Line, Point},
+    term::{
+        cell::{Flags, LineLength},
+        search::{Match, RegexIter, RegexSearch},
+        test::TermSize,
+    },
+    vte::ansi,
+    Term,
 };
 use crossbeam_channel::Sender;
 use lapce_rpc::{proxy::ProxyRpcHandler, terminal::TermId};
@@ -22,15 +28,22 @@ impl EventListener for EventProxy {
                 self.proxy.terminal_write(self.term_id, s);
             }
             alacritty_terminal::event::Event::MouseCursorDirty => {
-                let _ = self
+                if let Err(err) = self
                     .term_notification_tx
-                    .send(TermNotification::RequestPaint);
+                    .send(TermNotification::RequestPaint)
+                {
+                    tracing::error!("{:?}", err);
+                }
             }
             alacritty_terminal::event::Event::Title(s) => {
-                let _ = self.term_notification_tx.send(TermNotification::SetTitle {
-                    term_id: self.term_id,
-                    title: s,
-                });
+                if let Err(err) =
+                    self.term_notification_tx.send(TermNotification::SetTitle {
+                        term_id: self.term_id,
+                        title: s,
+                    })
+                {
+                    tracing::error!("{:?}", err);
+                }
             }
             _ => (),
         }
@@ -49,7 +62,10 @@ impl RawTerminal {
         proxy: ProxyRpcHandler,
         term_notification_tx: Sender<TermNotification>,
     ) -> Self {
-        let config = alacritty_terminal::term::Config::default();
+        let config = alacritty_terminal::term::Config {
+            semantic_escape_chars: ",│`|\"' ()[]{}<>\t".to_string(),
+            ..Default::default()
+        };
         let event_proxy = EventProxy {
             term_id,
             proxy,
@@ -71,6 +87,45 @@ impl RawTerminal {
         for byte in content {
             self.parser.advance(&mut self.term, byte);
         }
+    }
+
+    pub fn output(&self, line_num: usize) -> Vec<String> {
+        let grid = self.term.grid();
+        let mut lines = Vec::with_capacity(5);
+        let mut rows = Vec::new();
+        for line in (grid.topmost_line().0..=grid.bottommost_line().0)
+            .map(Line)
+            .rev()
+        {
+            let row_cell = &grid[line];
+            if row_cell[Column(row_cell.len() - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+            {
+                rows.push(row_cell);
+            } else {
+                if !rows.is_empty() {
+                    let mut new_line = Vec::new();
+                    std::mem::swap(&mut rows, &mut new_line);
+                    let line_str: String = new_line
+                        .into_iter()
+                        .rev()
+                        .flat_map(|x| {
+                            x.into_iter().take(x.line_length().0).map(|x| x.c)
+                        })
+                        .collect();
+                    lines.push(line_str);
+                    if lines.len() >= line_num {
+                        break;
+                    }
+                }
+                rows.push(row_cell);
+            }
+        }
+        for line in &lines {
+            tracing::info!("{}", line);
+        }
+        lines
     }
 }
 

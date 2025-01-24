@@ -1,23 +1,25 @@
 use std::{rc::Rc, sync::Arc};
 
 use floem::{
-    cosmic_text::Style as FontStyle,
     event::EventListener,
     peniko::Color,
-    reactive::{create_rw_signal, ReadSignal, RwSignal},
+    reactive::{
+        create_rw_signal, ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith,
+    },
     style::CursorStyle,
-    view::View,
+    text::Style as FontStyle,
     views::{
         container, dyn_stack, label, scroll, stack, svg, text, virtual_stack,
         Decorators, VirtualDirection, VirtualItemSize,
     },
+    View,
 };
 use lapce_rpc::{
     dap_types::{DapId, ThreadId},
     terminal::TermId,
 };
 
-use super::{position::PanelPosition, view::PanelBuilder};
+use super::{data::PanelSection, position::PanelPosition, view::PanelBuilder};
 use crate::{
     app::clickable_icon,
     command::InternalCommand,
@@ -43,18 +45,26 @@ pub fn debug_panel(
             "Processes",
             150.0,
             debug_processes(terminal.clone(), config),
+            window_tab_data.panel.section_open(PanelSection::Process),
         )
-        .add("Variables", variables_view(window_tab_data.clone()))
+        .add(
+            "Variables",
+            variables_view(window_tab_data.clone()),
+            window_tab_data.panel.section_open(PanelSection::Variable),
+        )
         .add(
             "Stack Frames",
             debug_stack_traces(terminal.clone(), internal_command, config),
+            window_tab_data.panel.section_open(PanelSection::StackFrame),
         )
         .add_height(
             "Breakpoints",
             150.0,
             breakpoints_view(window_tab_data.clone()),
+            window_tab_data.panel.section_open(PanelSection::Breakpoint),
         )
         .build()
+        .debug_name("Debug Panel")
 }
 
 fn debug_process_icons(

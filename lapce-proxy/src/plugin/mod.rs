@@ -33,23 +33,29 @@ use lapce_rpc::{
 use lapce_xi_rope::{Rope, RopeDelta};
 use lsp_types::{
     request::{
-        CodeActionRequest, CodeActionResolveRequest, Completion,
-        DocumentSymbolRequest, Formatting, GotoDefinition, GotoTypeDefinition,
+        CallHierarchyIncomingCalls, CallHierarchyPrepare, CodeActionRequest,
+        CodeActionResolveRequest, CodeLensRequest, CodeLensResolve, Completion,
+        DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition,
+        GotoImplementation, GotoImplementationResponse, GotoTypeDefinition,
         GotoTypeDefinitionParams, GotoTypeDefinitionResponse, HoverRequest,
         InlayHintRequest, InlineCompletionRequest, PrepareRenameRequest, References,
         Rename, Request, ResolveCompletionItem, SelectionRangeRequest,
         SemanticTokensFullRequest, SignatureHelpRequest, WorkspaceSymbolRequest,
     },
+    CallHierarchyClientCapabilities, CallHierarchyIncomingCall,
+    CallHierarchyIncomingCallsParams, CallHierarchyItem, CallHierarchyPrepareParams,
     ClientCapabilities, CodeAction, CodeActionCapabilityResolveSupport,
     CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams,
-    CodeActionResponse, CompletionClientCapabilities, CompletionItem,
-    CompletionItemCapability, CompletionItemCapabilityResolveSupport,
-    CompletionParams, CompletionResponse, Diagnostic, DocumentFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FormattingOptions, GotoCapability,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverClientCapabilities,
-    HoverParams, InlayHint, InlayHintClientCapabilities, InlayHintParams,
-    InlineCompletionClientCapabilities, InlineCompletionParams,
+    CodeActionResponse, CodeLens, CodeLensParams, CompletionClientCapabilities,
+    CompletionItem, CompletionItemCapability,
+    CompletionItemCapabilityResolveSupport, CompletionParams, CompletionResponse,
+    Diagnostic, DocumentFormattingParams, DocumentSymbolClientCapabilities,
+    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeClientCapabilities, FoldingRangeParams, FormattingOptions,
+    GotoCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverClientCapabilities, HoverParams, InlayHint, InlayHintClientCapabilities,
+    InlayHintParams, InlineCompletionClientCapabilities, InlineCompletionParams,
     InlineCompletionResponse, InlineCompletionTriggerKind, Location, MarkupKind,
     MessageActionItemCapabilities, ParameterInformationSettings,
     PartialResultParams, Position, PrepareRenameResponse,
@@ -67,7 +73,7 @@ use lsp_types::{
 };
 use parking_lot::Mutex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tar::Archive;
 use tracing::error;
 
@@ -237,7 +243,9 @@ impl PluginCatalogRpcHandler {
     #[allow(dead_code)]
     fn handle_response(&self, id: RequestId, result: Result<Value, RpcError>) {
         if let Some(chan) = { self.pending.lock().remove(&id) } {
-            let _ = chan.send(result);
+            if let Err(err) = chan.send(result) {
+                tracing::error!("{:?}", err);
+            }
         }
     }
 
@@ -350,8 +358,14 @@ impl PluginCatalogRpcHandler {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.catalog_notification(PluginCatalogNotification::Shutdown);
-        let _ = self.plugin_tx.send(PluginCatalogRpc::Shutdown);
+        if let Err(err) =
+            self.catalog_notification(PluginCatalogNotification::Shutdown)
+        {
+            tracing::error!("{:?}", err);
+        }
+        if let Err(err) = self.plugin_tx.send(PluginCatalogRpc::Shutdown) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn catalog_notification(
@@ -439,7 +453,9 @@ impl PluginCatalogRpcHandler {
             check,
             f: Box::new(f),
         };
-        let _ = self.plugin_tx.send(rpc);
+        if let Err(err) = self.plugin_tx.send(rpc) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -461,7 +477,9 @@ impl PluginCatalogRpcHandler {
             path,
             check,
         };
-        let _ = self.plugin_tx.send(rpc);
+        if let Err(err) = self.plugin_tx.send(rpc) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn format_semantic_tokens(
@@ -471,24 +489,32 @@ impl PluginCatalogRpcHandler {
         text: Rope,
         f: Box<dyn RpcCallback<Vec<LineStyle>, RpcError>>,
     ) {
-        let _ = self.plugin_tx.send(PluginCatalogRpc::FormatSemanticTokens {
-            plugin_id,
-            tokens,
-            text,
-            f,
-        });
+        if let Err(err) =
+            self.plugin_tx.send(PluginCatalogRpc::FormatSemanticTokens {
+                plugin_id,
+                tokens,
+                text,
+                f,
+            })
+        {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn did_save_text_document(&self, path: &Path, text: Rope) {
         let text_document =
             TextDocumentIdentifier::new(Url::from_file_path(path).unwrap());
         let language_id = language_id_from_path(path).unwrap_or("").to_string();
-        let _ = self.plugin_tx.send(PluginCatalogRpc::DidSaveTextDocument {
-            language_id,
-            text_document,
-            path: path.into(),
-            text,
-        });
+        if let Err(err) =
+            self.plugin_tx.send(PluginCatalogRpc::DidSaveTextDocument {
+                language_id,
+                text_document,
+                path: path.into(),
+                text,
+            })
+        {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn did_change_text_document(
@@ -504,15 +530,18 @@ impl PluginCatalogRpcHandler {
             rev as i32,
         );
         let language_id = language_id_from_path(path).unwrap_or("").to_string();
-        let _ = self
-            .plugin_tx
-            .send(PluginCatalogRpc::DidChangeTextDocument {
-                language_id,
-                document,
-                delta,
-                text,
-                new_text,
-            });
+        if let Err(err) =
+            self.plugin_tx
+                .send(PluginCatalogRpc::DidChangeTextDocument {
+                    language_id,
+                    document,
+                    delta,
+                    text,
+                    new_text,
+                })
+        {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn get_definition(
@@ -577,6 +606,65 @@ impl PluginCatalogRpcHandler {
         );
     }
 
+    pub fn call_hierarchy_incoming(
+        &self,
+        path: &Path,
+        item: CallHierarchyItem,
+        cb: impl FnOnce(
+                PluginId,
+                Result<Option<Vec<CallHierarchyIncomingCall>>, RpcError>,
+            ) + Clone
+            + Send
+            + 'static,
+    ) {
+        let method = CallHierarchyIncomingCalls::METHOD;
+        let params = CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let language_id =
+            Some(language_id_from_path(path).unwrap_or("").to_string());
+        self.send_request_to_all_plugins(
+            method,
+            params,
+            language_id,
+            Some(path.to_path_buf()),
+            cb,
+        );
+    }
+
+    pub fn show_call_hierarchy(
+        &self,
+        path: &Path,
+        position: Position,
+        cb: impl FnOnce(PluginId, Result<Option<Vec<CallHierarchyItem>>, RpcError>)
+            + Clone
+            + Send
+            + 'static,
+    ) {
+        let uri = Url::from_file_path(path).unwrap();
+        let method = CallHierarchyPrepare::METHOD;
+        let params = CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let language_id =
+            Some(language_id_from_path(path).unwrap_or("").to_string());
+        self.send_request_to_all_plugins(
+            method,
+            params,
+            language_id,
+            Some(path.to_path_buf()),
+            cb,
+        );
+    }
+
     pub fn get_references(
         &self,
         path: &Path,
@@ -598,6 +686,66 @@ impl PluginCatalogRpcHandler {
             context: ReferenceContext {
                 include_declaration: false,
             },
+        };
+
+        let language_id =
+            Some(language_id_from_path(path).unwrap_or("").to_string());
+        self.send_request_to_all_plugins(
+            method,
+            params,
+            language_id,
+            Some(path.to_path_buf()),
+            cb,
+        );
+    }
+
+    pub fn get_lsp_folding_range(
+        &self,
+        path: &Path,
+        cb: impl FnOnce(
+                PluginId,
+                std::result::Result<Option<Vec<FoldingRange>>, RpcError>,
+            ) + Clone
+            + Send
+            + 'static,
+    ) {
+        let uri = Url::from_file_path(path).unwrap();
+        let method = FoldingRangeRequest::METHOD;
+        let params = FoldingRangeParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+
+        let language_id =
+            Some(language_id_from_path(path).unwrap_or("").to_string());
+        self.send_request_to_all_plugins(
+            method,
+            params,
+            language_id,
+            Some(path.to_path_buf()),
+            cb,
+        );
+    }
+
+    pub fn go_to_implementation(
+        &self,
+        path: &Path,
+        position: Position,
+        cb: impl FnOnce(PluginId, Result<Option<GotoImplementationResponse>, RpcError>)
+            + Clone
+            + Send
+            + 'static,
+    ) {
+        let uri = Url::from_file_path(path).unwrap();
+        let method = GotoImplementation::METHOD;
+        let params = GotoTypeDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
         };
 
         let language_id =
@@ -642,6 +790,53 @@ impl PluginCatalogRpcHandler {
         self.send_request_to_all_plugins(
             method,
             params,
+            language_id,
+            Some(path.to_path_buf()),
+            cb,
+        );
+    }
+
+    pub fn get_code_lens(
+        &self,
+        path: &Path,
+        cb: impl FnOnce(PluginId, Result<Option<Vec<CodeLens>>, RpcError>)
+            + Clone
+            + Send
+            + 'static,
+    ) {
+        let uri = Url::from_file_path(path).unwrap();
+        let method = CodeLensRequest::METHOD;
+        let params = CodeLensParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+
+        let language_id =
+            Some(language_id_from_path(path).unwrap_or("").to_string());
+
+        self.send_request_to_all_plugins(
+            method,
+            params,
+            language_id,
+            Some(path.to_path_buf()),
+            cb,
+        );
+    }
+
+    pub fn get_code_lens_resolve(
+        &self,
+        path: &Path,
+        code_lens: &CodeLens,
+        cb: impl FnOnce(PluginId, Result<CodeLens, RpcError>) + Clone + Send + 'static,
+    ) {
+        let method = CodeLensResolve::METHOD;
+        let language_id =
+            Some(language_id_from_path(path).unwrap_or("").to_string());
+
+        self.send_request_to_all_plugins(
+            method,
+            code_lens,
             language_id,
             Some(path.to_path_buf()),
             cb,
@@ -948,14 +1143,17 @@ impl PluginCatalogRpcHandler {
             params,
             language_id,
             Some(path.to_path_buf()),
-            move |plugin_id, result| {
-                if let Ok(value) = result {
+            move |plugin_id, result| match result {
+                Ok(value) => {
                     if let Ok(resp) =
                         serde_json::from_value::<CompletionResponse>(value)
                     {
                         core_rpc
                             .completion_response(request_id, input, resp, plugin_id);
                     }
+                }
+                Err(err) => {
+                    tracing::error!("{:?}", err);
                 }
             },
         );
@@ -1027,13 +1225,16 @@ impl PluginCatalogRpcHandler {
             language_id,
             Some(path.to_path_buf()),
             true,
-            move |plugin_id, result| {
-                if let Ok(value) = result {
+            move |plugin_id, result| match result {
+                Ok(value) => {
                     if let Ok(resp) = serde_json::from_value::<SignatureHelp>(value)
                     {
                         core_rpc
                             .signature_help_response(request_id, resp, plugin_id);
                     }
+                }
+                Err(err) => {
+                    tracing::error!("{:?}", err);
                 }
             },
         );
@@ -1082,14 +1283,25 @@ impl PluginCatalogRpcHandler {
         version: i32,
         text: String,
     ) {
-        let _ = self.plugin_tx.send(PluginCatalogRpc::DidOpenTextDocument {
-            document: TextDocumentItem::new(
-                Url::from_file_path(path).unwrap(),
-                language_id,
-                version,
-                text,
-            ),
-        });
+        match Url::from_file_path(path) {
+            Ok(path) => {
+                if let Err(err) =
+                    self.plugin_tx.send(PluginCatalogRpc::DidOpenTextDocument {
+                        document: TextDocumentItem::new(
+                            path,
+                            language_id,
+                            version,
+                            text,
+                        ),
+                    })
+                {
+                    tracing::error!("{:?}", err);
+                }
+            }
+            Err(_) => {
+                tracing::error!("Failed to parse URL from file path: {path:?}");
+            }
+        }
     }
 
     pub fn unactivated_volts(&self, volts: Vec<VoltMetadata>) -> Result<()> {
@@ -1128,7 +1340,9 @@ impl PluginCatalogRpcHandler {
                 }
             }),
         };
-        let _ = self.plugin_tx.send(rpc);
+        if let Err(err) = self.plugin_tx.send(rpc) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn remove_volt(&self, volt: VoltMetadata) {
@@ -1145,7 +1359,9 @@ impl PluginCatalogRpcHandler {
                 }
             }),
         };
-        let _ = self.plugin_tx.send(rpc);
+        if let Err(err) = self.plugin_tx.send(rpc) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn reload_volt(&self, volt: VoltMetadata) -> Result<()> {
@@ -1263,11 +1479,13 @@ impl PluginCatalogRpcHandler {
         reference: usize,
         f: impl FnOnce(Result<Vec<dap_types::Variable>, RpcError>) + Send + 'static,
     ) {
-        let _ = self.plugin_tx.send(PluginCatalogRpc::DapVariable {
+        if let Err(err) = self.plugin_tx.send(PluginCatalogRpc::DapVariable {
             dap_id,
             reference,
             f: Box::new(f),
-        });
+        }) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn dap_get_scopes(
@@ -1279,11 +1497,13 @@ impl PluginCatalogRpcHandler {
             ) + Send
             + 'static,
     ) {
-        let _ = self.plugin_tx.send(PluginCatalogRpc::DapGetScopes {
+        if let Err(err) = self.plugin_tx.send(PluginCatalogRpc::DapGetScopes {
             dap_id,
             frame_id,
             f: Box::new(f),
-        });
+        }) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn register_debugger_type(
@@ -1292,13 +1512,15 @@ impl PluginCatalogRpcHandler {
         program: String,
         args: Option<Vec<String>>,
     ) {
-        let _ = self.catalog_notification(
+        if let Err(err) = self.catalog_notification(
             PluginCatalogNotification::RegisterDebuggerType {
                 debugger_type,
                 program,
                 args,
             },
-        );
+        ) {
+            tracing::error!("{:?}", err);
+        }
     }
 }
 
@@ -1336,7 +1558,7 @@ pub fn download_volt(volt: &VoltInfo) -> Result<VoltMetadata> {
         volt.author, volt.name, volt.version
     );
 
-    let resp = reqwest::blocking::get(url)?;
+    let resp = crate::get_url(url, None)?;
     if !resp.status().is_success() {
         return Err(anyhow!("can't download plugin"));
     }
@@ -1344,7 +1566,7 @@ pub fn download_volt(volt: &VoltInfo) -> Result<VoltMetadata> {
     // this is the s3 url
     let url = resp.text()?;
 
-    let mut resp = reqwest::blocking::get(url)?;
+    let mut resp = crate::get_url(url, None)?;
     if !resp.status().is_success() {
         return Err(anyhow!("can't download plugin"));
     }
@@ -1359,7 +1581,9 @@ pub fn download_volt(volt: &VoltInfo) -> Result<VoltMetadata> {
     let plugin_dir = Directory::plugins_directory()
         .ok_or_else(|| anyhow!("can't get plugin directory"))?
         .join(id.to_string());
-    let _ = fs::remove_dir_all(&plugin_dir);
+    if let Err(err) = fs::remove_dir_all(&plugin_dir) {
+        tracing::error!("{:?}", err);
+    }
     fs::create_dir_all(&plugin_dir)?;
 
     if is_zstd {
@@ -1392,7 +1616,11 @@ pub fn install_volt(
     let local_catalog_rpc = catalog_rpc.clone();
     let local_meta = meta.clone();
 
-    let _ = start_volt(workspace, configurations, local_catalog_rpc, local_meta);
+    if let Err(err) =
+        start_volt(workspace, configurations, local_catalog_rpc, local_meta)
+    {
+        tracing::error!("{:?}", err);
+    }
     let icon = volt_icon(&meta);
     catalog_rpc.core_rpc.volt_installed(meta, icon);
     Ok(())
@@ -1436,6 +1664,17 @@ pub fn remove_volt(
 }
 
 fn client_capabilities() -> ClientCapabilities {
+    // https://github.com/rust-lang/rust-analyzer/blob/master/docs/dev/lsp-extensions.md#server-status
+    let mut experimental = Map::new();
+    experimental.insert("serverStatusNotification".into(), true.into());
+    let command_vec = ["rust-analyzer.runSingle", "rust-analyzer.debugSingle"]
+        .map(Value::from)
+        .to_vec();
+
+    let mut commands = Map::new();
+    experimental.insert("serverStatusNotification".into(), true.into());
+    commands.insert("commands".into(), command_vec.into());
+    experimental.insert("commands".into(), commands.into());
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
             synchronization: Some(TextDocumentSyncClientCapabilities {
@@ -1519,7 +1758,20 @@ fn client_capabilities() -> ClientCapabilities {
             inline_completion: Some(InlineCompletionClientCapabilities {
                 ..Default::default()
             }),
-
+            call_hierarchy: Some(CallHierarchyClientCapabilities {
+                dynamic_registration: Some(true),
+            }),
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
+            }),
+            folding_range: Some(FoldingRangeClientCapabilities {
+                dynamic_registration: Some(false),
+                range_limit: None,
+                line_folding_only: Some(false),
+                folding_range_kind: None,
+                folding_range: None,
+            }),
             ..Default::default()
         }),
         window: Some(WindowClientCapabilities {
@@ -1539,6 +1791,7 @@ fn client_capabilities() -> ClientCapabilities {
             workspace_folders: Some(true),
             ..Default::default()
         }),
+        experimental: Some(experimental.into()),
         ..Default::default()
     }
 }

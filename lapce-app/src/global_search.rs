@@ -3,7 +3,7 @@ use std::{ops::Range, path::PathBuf, rc::Rc};
 use floem::{
     ext_event::create_ext_action,
     keyboard::Modifiers,
-    reactive::{Memo, RwSignal, Scope},
+    reactive::{Memo, RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
     views::VirtualVector,
 };
 use indexmap::IndexMap;
@@ -38,7 +38,7 @@ impl SearchMatchData {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GlobalSearchData {
     pub editor: EditorData,
     pub search_result: RwSignal<IndexMap<PathBuf, SearchMatchData>>,

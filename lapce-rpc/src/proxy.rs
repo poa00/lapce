@@ -11,11 +11,12 @@ use crossbeam_channel::{Receiver, Sender};
 use indexmap::IndexMap;
 use lapce_xi_rope::RopeDelta;
 use lsp_types::{
-    request::GotoTypeDefinitionResponse, CodeAction, CodeActionResponse,
-    CompletionItem, Diagnostic, DocumentSymbolResponse, GotoDefinitionResponse,
-    Hover, InlayHint, InlineCompletionResponse, InlineCompletionTriggerKind,
-    Location, Position, PrepareRenameResponse, SelectionRange, SymbolInformation,
-    TextDocumentItem, TextEdit, WorkspaceEdit,
+    request::{GotoImplementationResponse, GotoTypeDefinitionResponse},
+    CallHierarchyIncomingCall, CallHierarchyItem, CodeAction, CodeActionResponse,
+    CodeLens, CompletionItem, Diagnostic, DocumentSymbolResponse, FoldingRange,
+    GotoDefinitionResponse, Hover, InlayHint, InlineCompletionResponse,
+    InlineCompletionTriggerKind, Location, Position, PrepareRenameResponse,
+    SelectionRange, SymbolInformation, TextDocumentItem, TextEdit, WorkspaceEdit,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ use crate::{
     buffer::BufferId,
     dap_types::{self, DapId, RunDebugConfig, SourceBreakpoint, ThreadId},
     file::{FileNodeItem, PathObject},
+    file_line::FileLine,
     plugin::{PluginId, VoltInfo, VoltMetadata},
     source_control::FileDiff,
     style::SemanticStyles,
@@ -99,10 +101,22 @@ pub enum ProxyRequest {
         path: PathBuf,
         position: Position,
     },
+    GotoImplementation {
+        path: PathBuf,
+        position: Position,
+    },
     GetDefinition {
         request_id: usize,
         path: PathBuf,
         position: Position,
+    },
+    ShowCallHierarchy {
+        path: PathBuf,
+        position: Position,
+    },
+    CallHierarchyIncoming {
+        path: PathBuf,
+        call_hierarchy_item: CallHierarchyItem,
     },
     GetTypeDefinition {
         request_id: usize,
@@ -120,6 +134,9 @@ pub enum ProxyRequest {
     GetSemanticTokens {
         path: PathBuf,
     },
+    LspFoldingRange {
+        path: PathBuf,
+    },
     PrepareRename {
         path: PathBuf,
         position: Position,
@@ -133,6 +150,13 @@ pub enum ProxyRequest {
         path: PathBuf,
         position: Position,
         diagnostics: Vec<Diagnostic>,
+    },
+    GetCodeLens {
+        path: PathBuf,
+    },
+    GetCodeLensResolve {
+        code_lens: CodeLens,
+        path: PathBuf,
     },
     GetDocumentSymbols {
         path: PathBuf,
@@ -192,6 +216,9 @@ pub enum ProxyRequest {
     DapGetScopes {
         dap_id: DapId,
         frame_id: usize,
+    },
+    ReferencesResolve {
+        items: Vec<Location>,
     },
 }
 
@@ -265,6 +292,9 @@ pub enum ProxyNotification {
     },
     GitDiscardWorkspaceChanges {},
     GitInit {},
+    LspCancel {
+        id: i32,
+    },
     TerminalWrite {
         term_id: TermId,
         content: String,
@@ -355,6 +385,12 @@ pub enum ProxyResponse {
         request_id: usize,
         definition: GotoDefinitionResponse,
     },
+    ShowCallHierarchyResponse {
+        items: Option<Vec<CallHierarchyItem>>,
+    },
+    CallHierarchyIncomingResponse {
+        items: Option<Vec<CallHierarchyIncomingCall>>,
+    },
     GetTypeDefinition {
         request_id: usize,
         definition: GotoTypeDefinitionResponse,
@@ -365,6 +401,22 @@ pub enum ProxyResponse {
     GetCodeActionsResponse {
         plugin_id: PluginId,
         resp: CodeActionResponse,
+    },
+    LspFoldingRangeResponse {
+        plugin_id: PluginId,
+        resp: Option<Vec<FoldingRange>>,
+    },
+    GetCodeLensResponse {
+        plugin_id: PluginId,
+        resp: Option<Vec<CodeLens>>,
+    },
+    GetCodeLensResolveResponse {
+        plugin_id: PluginId,
+        resp: CodeLens,
+    },
+    GotoImplementationResponse {
+        plugin_id: PluginId,
+        resp: Option<GotoImplementationResponse>,
     },
     GetFilesResponse {
         items: Vec<PathBuf>,
@@ -413,6 +465,9 @@ pub enum ProxyResponse {
     },
     Success {},
     SaveResponse {},
+    ReferencesResolveResponse {
+        items: Vec<FileLine>,
+    },
 }
 
 pub type ProxyMessage = RpcMessage<ProxyRequest, ProxyNotification, ProxyResponse>;
@@ -436,7 +491,9 @@ impl ResponseHandler {
         match self {
             ResponseHandler::Callback(f) => f(result),
             ResponseHandler::Chan(tx) => {
-                let _ = tx.send(result);
+                if let Err(err) = tx.send(result) {
+                    tracing::error!("{:?}", err);
+                }
             }
         }
     }
@@ -495,7 +552,9 @@ impl ProxyRpcHandler {
 
         self.pending.lock().insert(id, rh);
 
-        let _ = self.tx.send(ProxyRpc::Request(id, request));
+        if let Err(err) = self.tx.send(ProxyRpc::Request(id, request)) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn request(&self, request: ProxyRequest) -> Result<ProxyResponse, RpcError> {
@@ -529,7 +588,13 @@ impl ProxyRpcHandler {
     }
 
     pub fn notification(&self, notification: ProxyNotification) {
-        let _ = self.tx.send(ProxyRpc::Notification(notification));
+        if let Err(err) = self.tx.send(ProxyRpc::Notification(notification)) {
+            tracing::error!("{:?}", err);
+        }
+    }
+
+    pub fn lsp_cancel(&self, id: i32) {
+        self.notification(ProxyNotification::LspCancel { id });
     }
 
     pub fn git_init(&self) {
@@ -566,7 +631,9 @@ impl ProxyRpcHandler {
 
     pub fn shutdown(&self) {
         self.notification(ProxyNotification::Shutdown {});
-        let _ = self.tx.send(ProxyRpc::Shutdown);
+        if let Err(err) = self.tx.send(ProxyRpc::Shutdown) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     pub fn initialize(
@@ -831,6 +898,30 @@ impl ProxyRpcHandler {
         );
     }
 
+    pub fn show_call_hierarchy(
+        &self,
+        path: PathBuf,
+        position: Position,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(ProxyRequest::ShowCallHierarchy { path, position }, f);
+    }
+
+    pub fn call_hierarchy_incoming(
+        &self,
+        path: PathBuf,
+        call_hierarchy_item: CallHierarchyItem,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(
+            ProxyRequest::CallHierarchyIncoming {
+                path,
+                call_hierarchy_item,
+            },
+            f,
+        );
+    }
+
     pub fn get_type_definition(
         &self,
         request_id: usize,
@@ -848,6 +939,14 @@ impl ProxyRpcHandler {
         );
     }
 
+    pub fn get_lsp_folding_range(
+        &self,
+        path: PathBuf,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(ProxyRequest::LspFoldingRange { path }, f);
+    }
+
     pub fn get_references(
         &self,
         path: PathBuf,
@@ -855,6 +954,23 @@ impl ProxyRpcHandler {
         f: impl ProxyCallback + 'static,
     ) {
         self.request_async(ProxyRequest::GetReferences { path, position }, f);
+    }
+
+    pub fn references_resolve(
+        &self,
+        items: Vec<Location>,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(ProxyRequest::ReferencesResolve { items }, f);
+    }
+
+    pub fn go_to_implementation(
+        &self,
+        path: PathBuf,
+        position: Position,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(ProxyRequest::GotoImplementation { path, position }, f);
     }
 
     pub fn get_code_actions(
@@ -872,6 +988,19 @@ impl ProxyRpcHandler {
             },
             f,
         );
+    }
+
+    pub fn get_code_lens(&self, path: PathBuf, f: impl ProxyCallback + 'static) {
+        self.request_async(ProxyRequest::GetCodeLens { path }, f);
+    }
+
+    pub fn get_code_lens_resolve(
+        &self,
+        code_lens: CodeLens,
+        path: PathBuf,
+        f: impl ProxyCallback + 'static,
+    ) {
+        self.request_async(ProxyRequest::GetCodeLensResolve { code_lens, path }, f);
     }
 
     pub fn get_document_formatting(

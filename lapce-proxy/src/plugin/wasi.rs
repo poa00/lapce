@@ -123,8 +123,15 @@ impl PluginServerHandler for Plugin {
         }
     }
 
-    fn handle_host_notification(&mut self, method: String, params: Params) {
-        let _ = self.host.handle_notification(method, params);
+    fn handle_host_notification(
+        &mut self,
+        method: String,
+        params: Params,
+        from: String,
+    ) {
+        if let Err(err) = self.host.handle_notification(method, params, from) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn handle_host_request(
@@ -215,8 +222,8 @@ impl Plugin {
             None,
             None,
             false,
-            move |value| {
-                if let Ok(value) = value {
+            move |value| match value {
+                Ok(value) => {
                     if let Ok(result) = serde_json::from_value(value) {
                         server_rpc.handle_rpc(PluginServerRpc::Handler(
                             PluginHandlerNotification::InitializeResult(result),
@@ -229,6 +236,9 @@ impl Plugin {
                             false,
                         );
                     }
+                }
+                Err(err) => {
+                    tracing::error!("{:?}", err);
                 }
             },
         );
@@ -255,7 +265,9 @@ pub fn load_all_volts(
             Some(meta)
         })
         .collect();
-    let _ = plugin_rpc.unactivated_volts(volts);
+    if let Err(err) = plugin_rpc.unactivated_volts(volts) {
+        tracing::error!("{:?}", err);
+    }
 }
 
 /// Find all installed volts.  
@@ -490,11 +502,17 @@ pub fn start_volt(
 
     let local_rpc = rpc.clone();
     let local_stdin = stdin.clone();
+    let volt_name = format!("volt {}", meta.name);
     linker.func_wrap("lapce", "host_handle_rpc", move || {
         if let Ok(msg) = wasi_read_string(&stdout) {
-            if let Some(resp) = handle_plugin_server_message(&local_rpc, &msg) {
+            if let Some(resp) =
+                handle_plugin_server_message(&local_rpc, &msg, &volt_name)
+            {
                 if let Ok(msg) = serde_json::to_string(&resp) {
-                    let _ = writeln!(local_stdin.write().unwrap(), "{msg}");
+                    if let Err(err) = writeln!(local_stdin.write().unwrap(), "{msg}")
+                    {
+                        tracing::error!("{:?}", err);
+                    }
                 }
             }
         }
@@ -527,9 +545,13 @@ pub fn start_volt(
                     break;
                 }
                 if let Ok(msg) = serde_json::to_string(&msg) {
-                    let _ = writeln!(stdin.write().unwrap(), "{msg}");
+                    if let Err(err) = writeln!(stdin.write().unwrap(), "{msg}") {
+                        tracing::error!("{:?}", err);
+                    }
                 }
-                let _ = handle_rpc.call(&mut store, ());
+                if let Err(err) = handle_rpc.call(&mut store, ()) {
+                    tracing::error!("{:?}", err);
+                }
             }
         }
         if let Some(id) = exist_id {

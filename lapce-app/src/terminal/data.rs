@@ -10,7 +10,7 @@ use alacritty_terminal::{
 use anyhow::anyhow;
 use floem::{
     keyboard::{Key, KeyEvent, Modifiers, NamedKey},
-    reactive::{RwSignal, Scope},
+    reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
     views::editor::text::SystemClipboard,
 };
 use lapce_core::{
@@ -32,13 +32,13 @@ use super::{
 };
 use crate::{
     command::{CommandExecuted, CommandKind, InternalCommand},
-    debug::RunDebugProcess,
+    debug::{RunDebugMode, RunDebugProcess},
     keypress::{condition::Condition, KeyPressFocus},
     window_tab::CommonData,
     workspace::LapceWorkspace,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TerminalData {
     pub scope: Scope,
     pub term_id: TermId,
@@ -420,7 +420,11 @@ impl TerminalData {
 
         {
             let raw = raw.clone();
-            let _ = common.term_tx.send((term_id, TermEvent::NewTerminal(raw)));
+            if let Err(err) =
+                common.term_tx.send((term_id, TermEvent::NewTerminal(raw)))
+            {
+                tracing::error!("{:?}", err);
+            }
             common.proxy.new_terminal(term_id, profile);
         }
 
@@ -430,6 +434,18 @@ impl TerminalData {
     pub fn send_keypress(&self, key: &KeyEvent) -> bool {
         if let Some(command) = Self::resolve_key_event(key) {
             self.receive_char(command);
+            true
+        } else if key.modifiers == Modifiers::ALT
+            && matches!(&key.key.logical_key, Key::Character(_))
+        {
+            if let Key::Character(c) = &key.key.logical_key {
+                // In terminal emulators, when the Alt key is combined with another character
+                // (such as Alt+a), a leading ESC (Escape, ASCII code 0x1B) character is usually
+                // sent followed by a sequence of that character. For example,
+                // Alt+a sends \x1Ba.
+                self.receive_char("\x1b");
+                self.receive_char(c.as_str());
+            }
             true
         } else {
             false
@@ -730,6 +746,20 @@ impl TerminalData {
             .proxy
             .terminal_resize(self.term_id, width, height);
     }
+
+    pub fn stop(&self) {
+        if let Some(dap_id) = self.run_debug.with_untracked(|x| {
+            if let Some(process) = x {
+                if !process.is_prelaunch && process.mode == RunDebugMode::Debug {
+                    return Some(process.config.dap_id);
+                }
+            }
+            None
+        }) {
+            self.common.proxy.dap_stop(dap_id);
+        }
+        self.common.proxy.terminal_close(self.term_id);
+    }
 }
 
 /// [`RunDebugConfig`] with expanded out program/arguments/etc. Used for creating the terminal.
@@ -771,14 +801,20 @@ impl ExpandedRunDebug {
             } else {
                 (run_debug.program.clone(), run_debug.args.clone())
             };
-
-        let program = if program == "${lapce}" {
+        let mut program = if program == "${lapce}" {
             std::env::current_exe().map_err(|e| {
                 anyhow!("Failed to get current exe for ${{lapce}} run and debug: {e}")
             })?.to_str().ok_or_else(|| anyhow!("Failed to convert ${{lapce}} path to str"))?.to_string()
         } else {
             program
         };
+
+        if program.contains("${workspace}") {
+            if let Some(workspace) = workspace.path.as_ref().and_then(|x| x.to_str())
+            {
+                program = program.replace("${workspace}", workspace);
+            }
+        }
 
         if let Some(args) = &mut args {
             for arg in args {

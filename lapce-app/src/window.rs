@@ -3,8 +3,12 @@ use std::{path::PathBuf, rc::Rc, sync::Arc};
 use floem::{
     action::TimerToken,
     peniko::kurbo::{Point, Size},
-    reactive::{use_context, Memo, ReadSignal, RwSignal, Scope},
+    reactive::{
+        use_context, Memo, ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate,
+        SignalWith,
+    },
     window::WindowId,
+    ViewId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +51,7 @@ pub struct WindowCommonData {
     pub cursor_blink_timer: RwSignal<TimerToken>,
     // the value to be update by curosr blinking
     pub hide_cursor: RwSignal<bool>,
-    pub app_view_id: RwSignal<floem::id::Id>,
+    pub app_view_id: RwSignal<ViewId>,
     pub extra_plugin_paths: Arc<Vec<PathBuf>>,
 }
 
@@ -72,7 +76,7 @@ pub struct WindowData {
     pub active: RwSignal<usize>,
     pub app_command: Listener<AppCommand>,
     pub position: RwSignal<Point>,
-    pub root_view_id: RwSignal<floem::id::Id>,
+    pub root_view_id: RwSignal<ViewId>,
     pub window_scale: RwSignal<f64>,
     pub config: RwSignal<Arc<LapceConfig>>,
     pub ime_enabled: RwSignal<bool>,
@@ -82,7 +86,7 @@ pub struct WindowData {
 impl WindowData {
     pub fn new(
         window_id: WindowId,
-        app_view_id: RwSignal<floem::id::Id>,
+        app_view_id: RwSignal<ViewId>,
         info: WindowInfo,
         window_scale: RwSignal<f64>,
         latest_release: ReadSignal<Arc<Option<ReleaseInfo>>>,
@@ -93,7 +97,7 @@ impl WindowData {
         let config =
             LapceConfig::load(&LapceWorkspace::default(), &[], &extra_plugin_paths);
         let config = cx.create_rw_signal(Arc::new(config));
-        let root_view_id = cx.create_rw_signal(floem::id::Id::next());
+        let root_view_id = cx.create_rw_signal(ViewId::new());
 
         let window_tabs = cx.create_rw_signal(im::Vector::new());
         let num_window_tabs =
@@ -199,13 +203,19 @@ impl WindowData {
         match cmd {
             WindowCommand::SetWorkspace { workspace } => {
                 let db: Arc<LapceDb> = use_context().unwrap();
-                let _ = db.update_recent_workspace(&workspace);
+                if let Err(err) = db.update_recent_workspace(&workspace) {
+                    tracing::error!("{:?}", err);
+                }
 
                 let active = self.active.get_untracked();
                 self.window_tabs.with_untracked(|window_tabs| {
                     if !window_tabs.is_empty() {
                         let active = window_tabs.len().saturating_sub(1).min(active);
-                        let _ = db.insert_window_tab(window_tabs[active].1.clone());
+                        if let Err(err) =
+                            db.insert_window_tab(window_tabs[active].1.clone())
+                        {
+                            tracing::error!("{:?}", err);
+                        }
                     }
                 });
 
@@ -230,7 +240,9 @@ impl WindowData {
             }
             WindowCommand::NewWorkspaceTab { workspace, end } => {
                 let db: Arc<LapceDb> = use_context().unwrap();
-                let _ = db.update_recent_workspace(&workspace);
+                if let Err(err) = db.update_recent_workspace(&workspace) {
+                    tracing::error!("{:?}", err);
+                }
 
                 let window_tab = Rc::new(WindowTabData::new(
                     self.scope,
@@ -271,7 +283,9 @@ impl WindowData {
                         let (_, old_window_tab) = window_tabs.remove(index);
                         old_window_tab.proxy.shutdown();
                         let db: Arc<LapceDb> = use_context().unwrap();
-                        let _ = db.save_window_tab(old_window_tab);
+                        if let Err(err) = db.save_window_tab(old_window_tab) {
+                            tracing::error!("{:?}", err);
+                        }
                     }
                 });
 
@@ -308,7 +322,8 @@ impl WindowData {
                 }
             }
             WindowCommand::NewWindow => {
-                self.app_command.send(AppCommand::NewWindow);
+                self.app_command
+                    .send(AppCommand::NewWindow { folder: None });
             }
             WindowCommand::CloseWindow => {
                 self.app_command

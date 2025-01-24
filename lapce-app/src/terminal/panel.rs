@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 use floem::{
     ext_event::create_ext_action,
-    reactive::{Memo, RwSignal, Scope},
+    reactive::{Memo, RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
 };
 use lapce_core::mode::Mode;
 use lapce_rpc::{
@@ -16,11 +16,12 @@ use lapce_rpc::{
 use super::{data::TerminalData, tab::TerminalTabData};
 use crate::{
     debug::{
-        DapData, DapVariable, RunDebugData, RunDebugMode, RunDebugProcess,
-        ScopeOrVar,
+        DapData, DapVariable, RunDebugConfigs, RunDebugData, RunDebugMode,
+        RunDebugProcess, ScopeOrVar,
     },
     id::TerminalTabId,
-    keypress::{EventRef, KeyPressData, KeyPressFocus},
+    keypress::{EventRef, KeyPressData, KeyPressFocus, KeyPressHandle},
+    main_split::MainSplitData,
     panel::kind::PanelKind,
     window_tab::{CommonData, Focus},
     workspace::LapceWorkspace,
@@ -39,6 +40,7 @@ pub struct TerminalPanelData {
     pub debug: RunDebugData,
     pub breakline: Memo<Option<(usize, PathBuf)>>,
     pub common: Rc<CommonData>,
+    pub main_split: MainSplitData,
 }
 
 impl TerminalPanelData {
@@ -46,6 +48,7 @@ impl TerminalPanelData {
         workspace: Arc<LapceWorkspace>,
         profile: Option<TerminalProfile>,
         common: Rc<CommonData>,
+        main_split: MainSplitData,
     ) -> Self {
         let terminal_tab =
             TerminalTabData::new(workspace.clone(), profile, common.clone());
@@ -108,6 +111,7 @@ impl TerminalPanelData {
             debug,
             breakline,
             common,
+            main_split,
         }
     }
 
@@ -135,7 +139,7 @@ impl TerminalPanelData {
         &self,
         event: impl Into<EventRef<'a>> + Copy,
         keypress: &KeyPressData,
-    ) -> bool {
+    ) -> Option<KeyPressHandle> {
         if self.tab_info.with_untracked(|info| info.tabs.is_empty()) {
             self.new_tab(None);
         }
@@ -143,19 +147,23 @@ impl TerminalPanelData {
         let tab = self.active_tab(false);
         let terminal = tab.and_then(|tab| tab.active_terminal(false));
         if let Some(terminal) = terminal {
-            let executed = keypress.key_down(event, &terminal);
+            let handle = keypress.key_down(event, &terminal);
             let mode = terminal.get_mode();
 
-            if !executed && mode == Mode::Terminal {
+            if !handle.handled && mode == Mode::Terminal {
                 if let EventRef::Keyboard(key_event) = event.into() {
                     if terminal.send_keypress(key_event) {
-                        return true;
+                        return Some(KeyPressHandle {
+                            handled: true,
+                            keymatch: handle.keymatch,
+                            keypress: handle.keypress,
+                        });
                     }
                 }
             }
-            executed
+            Some(handle)
         } else {
-            false
+            None
         }
     }
 
@@ -216,19 +224,40 @@ impl TerminalPanelData {
     }
 
     pub fn close_tab(&self, terminal_tab_id: Option<TerminalTabId>) {
-        self.tab_info.update(|info| {
-            if let Some(terminal_tab_id) = terminal_tab_id {
-                info.tabs
-                    .retain(|(_, t)| t.terminal_tab_id != terminal_tab_id);
-            } else {
-                let active = info.active.min(info.tabs.len().saturating_sub(1));
-                if !info.tabs.is_empty() {
-                    info.tabs.remove(active);
+        if let Some(close_tab) = self
+            .tab_info
+            .try_update(|info| {
+                let mut close_tab = None;
+                if let Some(terminal_tab_id) = terminal_tab_id {
+                    if let Some(index) =
+                        info.tabs.iter().enumerate().find_map(|(index, (_, t))| {
+                            if t.terminal_tab_id == terminal_tab_id {
+                                Some(index)
+                            } else {
+                                None
+                            }
+                        })
+                    {
+                        close_tab = Some(
+                            info.tabs.remove(index).1.terminals.get_untracked(),
+                        );
+                    }
+                } else {
+                    let active = info.active.min(info.tabs.len().saturating_sub(1));
+                    if !info.tabs.is_empty() {
+                        info.tabs.remove(active);
+                    }
                 }
+                let new_active = info.active.min(info.tabs.len().saturating_sub(1));
+                info.active = new_active;
+                close_tab
+            })
+            .flatten()
+        {
+            for (_, data) in close_tab {
+                data.stop();
             }
-            let new_active = info.active.min(info.tabs.len().saturating_sub(1));
-            info.active = new_active;
-        });
+        }
         self.update_debug_active_term();
     }
 
@@ -352,7 +381,7 @@ impl TerminalPanelData {
         }
     }
 
-    pub fn terminal_stopped(&self, term_id: &TermId) {
+    pub fn terminal_stopped(&self, term_id: &TermId, exit_code: Option<i32>) {
         if let Some(terminal) = self.get_terminal(term_id) {
             if terminal.run_debug.with_untracked(|r| r.is_some()) {
                 let was_prelaunch = terminal
@@ -377,7 +406,8 @@ impl TerminalPanelData {
                         }
                     })
                     .unwrap();
-                if was_prelaunch == Some(true) {
+                let exit_code = exit_code.unwrap_or(0);
+                if was_prelaunch == Some(true) && exit_code == 0 {
                     let run_debug = terminal.run_debug.get_untracked();
                     if let Some(run_debug) = run_debug {
                         if run_debug.mode == RunDebugMode::Debug {
@@ -434,14 +464,22 @@ impl TerminalPanelData {
         })
     }
 
-    pub fn restart_run_debug(&self, term_id: TermId) -> Option<()> {
+    /// Return whether it is in debug mode.
+    pub fn restart_run_debug(&self, term_id: TermId) -> Option<bool> {
         let (_, terminal_tab, index, terminal) =
             self.get_terminal_in_tab(&term_id)?;
-        let run_debug = terminal.run_debug.get_untracked()?;
+        let mut run_debug = terminal.run_debug.get_untracked()?;
+        if run_debug.config.config_source.from_palette() {
+            if let Some(new_config) =
+                self.get_run_config_by_name(&run_debug.config.name)
+            {
+                run_debug.config = new_config;
+            }
+        }
+        let mut is_debug = false;
         let new_term_id = match run_debug.mode {
             RunDebugMode::Run => {
                 self.common.proxy.terminal_close(term_id);
-
                 let mut run_debug = run_debug;
                 run_debug.stopped = false;
                 run_debug.is_prelaunch = true;
@@ -461,6 +499,7 @@ impl TerminalPanelData {
                 new_term_id
             }
             RunDebugMode::Debug => {
+                is_debug = true;
                 let dap_id =
                     terminal.run_debug.get_untracked().as_ref()?.config.dap_id;
                 let daps = self.debug.daps.get_untracked();
@@ -474,7 +513,27 @@ impl TerminalPanelData {
 
         self.focus_terminal(new_term_id);
 
-        Some(())
+        Some(is_debug)
+    }
+
+    fn get_run_config_by_name(&self, name: &str) -> Option<RunDebugConfig> {
+        if let Some(workspace) = self.common.workspace.path.as_deref() {
+            let run_toml = workspace.join(".lapce").join("run.toml");
+            let (doc, new_doc) = self.main_split.get_doc(run_toml.clone(), None);
+            if !new_doc {
+                let content = doc.buffer.with_untracked(|b| b.to_string());
+                match toml::from_str::<RunDebugConfigs>(&content) {
+                    Ok(configs) => {
+                        return configs.configs.into_iter().find(|x| x.name == name);
+                    }
+                    Err(err) => {
+                        // todo show message window
+                        tracing::error!("deser fail {:?}", err);
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn focus_terminal(&self, term_id: TermId) {

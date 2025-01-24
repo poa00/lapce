@@ -4,16 +4,17 @@ use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 use floem::{
     action::show_context_menu,
+    event::EventPropagation,
     ext_event::create_ext_action,
     keyboard::Modifiers,
     menu::{Menu, MenuItem},
-    reactive::{RwSignal, Scope},
+    reactive::{ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
     views::editor::text::SystemClipboard,
-    EventPropagation,
 };
 use globset::Glob;
 use lapce_core::{
@@ -22,12 +23,16 @@ use lapce_core::{
     register::Clipboard,
 };
 use lapce_rpc::{
-    file::{Duplicating, FileNodeItem, Naming, NamingState, NewNode, Renaming},
+    file::{
+        Duplicating, FileNodeItem, FileNodeViewKind, Naming, NamingState, NewNode,
+        Renaming,
+    },
     proxy::ProxyResponse,
 };
 
 use crate::{
     command::{CommandExecuted, CommandKind, InternalCommand, LapceCommand},
+    config::LapceConfig,
     editor::EditorData,
     keypress::{condition::Condition, KeyPressFocus},
     main_split::Editors,
@@ -43,13 +48,15 @@ enum RenamedPath {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FileExplorerData {
     pub root: RwSignal<FileNodeItem>,
     pub naming: RwSignal<Naming>,
     pub naming_editor_data: EditorData,
     pub common: Rc<CommonData>,
+    pub scroll_to_line: RwSignal<Option<f64>>,
     left_diff_path: RwSignal<Option<PathBuf>>,
+    pub select: RwSignal<Option<FileNodeViewKind>>,
 }
 
 impl KeyPressFocus for FileExplorerData {
@@ -128,7 +135,9 @@ impl FileExplorerData {
             naming,
             naming_editor_data,
             common,
+            scroll_to_line: cx.create_rw_signal(None),
             left_diff_path: cx.create_rw_signal(None),
+            select: cx.create_rw_signal(None),
         };
         if data.common.workspace.path.is_some() {
             // only fill in the child files if there is open folder
@@ -387,10 +396,10 @@ impl FileExplorerData {
         self.naming.set(Naming::None);
     }
 
-    pub fn click(&self, path: &Path) {
+    pub fn click(&self, path: &Path, config: ReadSignal<Arc<LapceConfig>>) {
         if self.is_dir(path) {
             self.toggle_expand(path);
-        } else {
+        } else if !config.get_untracked().core.file_explorer_double_click {
             self.common
                 .internal_command
                 .send(InternalCommand::OpenFile {
@@ -399,9 +408,73 @@ impl FileExplorerData {
         }
     }
 
-    pub fn double_click(&self, path: &Path) -> EventPropagation {
+    pub fn reveal_in_file_tree(&self, path: PathBuf) {
+        let done = self
+            .root
+            .try_update(|root| {
+                // the directories in which the file are located are all readed and opened
+                if root.get_file_node(&path).is_some() {
+                    for current_path in path.ancestors() {
+                        if let Some(file) = root.get_file_node_mut(current_path) {
+                            if file.is_dir {
+                                file.open = true;
+                            }
+                        }
+                    }
+                    root.update_node_count_recursive(&path);
+                    true
+                } else {
+                    // read and open the directories in which the file are located
+                    let mut read_dir = None;
+                    // Whether the file is in the workspace
+                    let mut exist = false;
+                    for current_path in path.ancestors() {
+                        if let Some(file) = root.get_file_node_mut(current_path) {
+                            exist = true;
+                            if file.is_dir {
+                                file.open = true;
+                                if !file.read {
+                                    read_dir = Some(current_path.to_path_buf())
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if let (true, Some(dir)) = (exist, read_dir) {
+                        let explorer = self.clone();
+                        let select_path = path.clone();
+                        self.read_dir_cb(&dir, move |_| {
+                            explorer.reveal_in_file_tree(select_path);
+                        })
+                    }
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if done {
+            let (found, line) =
+                self.root.with_untracked(|x| x.find_file_at_line(&path));
+            if found {
+                self.scroll_to_line.set(Some(line));
+                self.select.set(Some(FileNodeViewKind::Path(path)));
+            }
+        }
+    }
+
+    pub fn double_click(
+        &self,
+        path: &Path,
+        config: ReadSignal<Arc<LapceConfig>>,
+    ) -> EventPropagation {
         if self.is_dir(path) {
             EventPropagation::Continue
+        } else if config.get_untracked().core.file_explorer_double_click {
+            self.common.internal_command.send(
+                InternalCommand::OpenAndConfirmedFile {
+                    path: path.to_path_buf(),
+                },
+            );
+            EventPropagation::Stop
         } else {
             self.common
                 .internal_command
@@ -486,21 +559,23 @@ impl FileExplorerData {
         // TODO: there are situations where we can open the file explorer to remote files
         if !common.workspace.kind.is_remote() {
             let path = path_a.clone();
-            menu = menu.entry(MenuItem::new("Reveal in file explorer").action(
-                move || {
-                    let path = path.parent().unwrap_or(&path);
-                    if !path.exists() {
-                        return;
-                    }
+            #[cfg(not(target_os = "macos"))]
+            let title = "Reveal in system file explorer";
+            #[cfg(target_os = "macos")]
+            let title = "Reveal in Finder";
+            menu = menu.entry(MenuItem::new(title).action(move || {
+                let path = path.parent().unwrap_or(&path);
+                if !path.exists() {
+                    return;
+                }
 
-                    if let Err(err) = open::that(path) {
-                        tracing::error!(
-                            "Failed to reveal file in system file explorer: {}",
-                            err
-                        );
-                    }
-                },
-            ));
+                if let Err(err) = open::that(path) {
+                    tracing::error!(
+                        "Failed to reveal file in system file explorer: {}",
+                        err
+                    );
+                }
+            }));
         }
 
         if !is_workspace {

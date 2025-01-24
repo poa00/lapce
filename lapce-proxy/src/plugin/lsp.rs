@@ -108,8 +108,15 @@ impl PluginServerHandler for LspClient {
         self.host.handle_request(id, method, params, resp);
     }
 
-    fn handle_host_notification(&mut self, method: String, params: Params) {
-        let _ = self.host.handle_notification(method, params);
+    fn handle_host_notification(
+        &mut self,
+        method: String,
+        params: Params,
+        from: String,
+    ) {
+        if let Err(err) = self.host.handle_notification(method, params, from) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn handle_did_save_text_document(
@@ -180,10 +187,13 @@ impl LspClient {
             "file" => {
                 let path = server_uri.to_file_path().map_err(|_| anyhow!(""))?;
                 #[cfg(unix)]
-                let _ = std::process::Command::new("chmod")
+                if let Err(err) = std::process::Command::new("chmod")
                     .arg("+x")
                     .arg(&path)
-                    .output();
+                    .output()
+                {
+                    tracing::error!("{:?}", err);
+                }
                 path.to_str().ok_or_else(|| anyhow!(""))?.to_string()
             }
             "urn" => server_uri.path().to_string(),
@@ -213,10 +223,15 @@ impl LspClient {
                     break;
                 }
                 if let Ok(msg) = serde_json::to_string(&msg) {
+                    tracing::debug!("write to lsp: {}", msg);
                     let msg =
                         format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
-                    let _ = writer.write(msg.as_bytes());
-                    let _ = writer.flush();
+                    if let Err(err) = writer.write(msg.as_bytes()) {
+                        tracing::error!("{:?}", err);
+                    }
+                    if let Err(err) = writer.flush() {
+                        tracing::error!("{:?}", err);
+                    }
                 }
             }
         });
@@ -224,16 +239,23 @@ impl LspClient {
         let local_server_rpc = server_rpc.clone();
         let core_rpc = plugin_rpc.core_rpc.clone();
         let volt_id_closure = volt_id.clone();
+        let name = volt_display_name.clone();
         thread::spawn(move || {
             let mut reader = Box::new(BufReader::new(stdout));
             loop {
                 match read_message(&mut reader) {
                     Ok(message_str) => {
+                        if !message_str.contains("$/progress") {
+                            tracing::debug!("read from lsp: {}", message_str);
+                        }
                         if let Some(resp) = handle_plugin_server_message(
                             &local_server_rpc,
                             &message_str,
+                            &name,
                         ) {
-                            let _ = io_tx.send(resp);
+                            if let Err(err) = io_tx.send(resp) {
+                                tracing::error!("{:?}", err);
+                            }
                         }
                     }
                     Err(_err) => {
@@ -340,6 +362,7 @@ impl LspClient {
             .workspace
             .clone()
             .map(|p| Url::from_directory_path(p).unwrap());
+        tracing::debug!("initialization_options {:?}", self.options);
         #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(process::id()),
@@ -361,29 +384,35 @@ impl LspClient {
             root_path: None,
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        if let Ok(value) = self.server_rpc.server_request(
+        match self.server_rpc.server_request(
             Initialize::METHOD,
             params,
             None,
             None,
             false,
         ) {
-            let result: InitializeResult = serde_json::from_value(value).unwrap();
-            self.host.server_capabilities = result.capabilities;
-            self.server_rpc.server_notification(
-                Initialized::METHOD,
-                InitializedParams {},
-                None,
-                None,
-                false,
-            );
-            if self
-                .plugin_rpc
-                .plugin_server_loaded(self.server_rpc.clone())
-                .is_err()
-            {
-                self.server_rpc.shutdown();
-                self.shutdown();
+            Ok(value) => {
+                let result: InitializeResult =
+                    serde_json::from_value(value).unwrap();
+                self.host.server_capabilities = result.capabilities;
+                self.server_rpc.server_notification(
+                    Initialized::METHOD,
+                    InitializedParams {},
+                    None,
+                    None,
+                    false,
+                );
+                if self
+                    .plugin_rpc
+                    .plugin_server_loaded(self.server_rpc.clone())
+                    .is_err()
+                {
+                    self.server_rpc.shutdown();
+                    self.shutdown();
+                }
+            }
+            Err(err) => {
+                tracing::error!("{:?}", err);
             }
         }
         //     move |result| {
@@ -399,8 +428,12 @@ impl LspClient {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        if let Err(err) = self.process.kill() {
+            tracing::error!("{:?}", err);
+        }
+        if let Err(err) = self.process.wait() {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn process(

@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use lapce_core::{directory::Directory, meta};
 use serde::Deserialize;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct ReleaseInfo {
     pub tag_name: String,
     pub target_commitish: String,
@@ -13,7 +13,7 @@ pub struct ReleaseInfo {
     pub version: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Debug)]
 pub struct ReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
@@ -30,19 +30,23 @@ pub fn get_latest_release() -> Result<ReleaseInfo> {
         _ => "https://api.github.com/repos/lapce/lapce/releases/latest",
     };
 
-    let resp = reqwest::blocking::ClientBuilder::new()
-        .user_agent("Lapce")
-        .build()?
-        .get(url)
-        .send()?;
+    let resp = lapce_proxy::get_url(url, Some("Lapce"))?;
     if !resp.status().is_success() {
         return Err(anyhow!("get release info failed {}", resp.text()?));
     }
     let mut release: ReleaseInfo = serde_json::from_str(&resp.text()?)?;
 
     release.version = match release.tag_name.as_str() {
-        "nightly" => format!("nightly-{}", &release.target_commitish[..7]),
-        _ => release.tag_name.clone(),
+        "nightly" => format!(
+            "{}+Nightly.{}",
+            env!("CARGO_PKG_VERSION"),
+            &release.target_commitish[..7]
+        ),
+        _ => release
+            .tag_name
+            .strip_prefix('v')
+            .unwrap_or(&release.tag_name)
+            .to_owned(),
     };
 
     Ok(release)
@@ -53,7 +57,11 @@ pub fn download_release(release: &ReleaseInfo) -> Result<PathBuf> {
         Directory::updates_directory().ok_or_else(|| anyhow!("no directory"))?;
     let name = match std::env::consts::OS {
         "macos" => "Lapce-macos.dmg",
-        "linux" => "Lapce-linux.tar.gz",
+        "linux" => match std::env::consts::ARCH {
+            "aarch64" => "lapce-linux-arm64.tar.gz",
+            "x86_64" => "lapce-linux-amd64.tar.gz",
+            _ => return Err(anyhow!("arch not supported")),
+        },
         #[cfg(feature = "portable")]
         "windows" => "Lapce-windows-portable.zip",
         #[cfg(not(feature = "portable"))]
@@ -64,7 +72,7 @@ pub fn download_release(release: &ReleaseInfo) -> Result<PathBuf> {
 
     for asset in &release.assets {
         if asset.name == name {
-            let mut resp = reqwest::blocking::get(&asset.browser_download_url)?;
+            let mut resp = lapce_proxy::get_url(&asset.browser_download_url, None)?;
             if !resp.status().is_success() {
                 return Err(anyhow!("download file error {}", resp.text()?));
             }
@@ -158,7 +166,7 @@ pub fn restart(path: &Path) -> Result<()> {
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
 pub fn restart(path: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    std::process::Command::new(path).arg("-n").exec();
+    let _ = std::process::Command::new(path).arg("-n").exec();
     Ok(())
 }
 
@@ -209,7 +217,10 @@ pub fn cleanup() {
     // Clean up backup exe after an update
     if let Ok(process_path) = std::env::current_exe() {
         if let Some(dst_parent) = process_path.parent() {
-            let _ = std::fs::remove_file(dst_parent.join("lapce.exe.bak"));
+            if let Err(err) = std::fs::remove_file(dst_parent.join("lapce.exe.bak"))
+            {
+                tracing::error!("{:?}", err);
+            }
         }
     }
 }
