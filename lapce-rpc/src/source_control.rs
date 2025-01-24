@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 pub struct DiffInfo {
     pub head: String,
     pub branches: Vec<String>,
+    pub tags: Vec<String>,
     pub diffs: Vec<FileDiff>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FileDiff {
     Modified(PathBuf),
     Added(PathBuf),
@@ -26,4 +27,21 @@ impl FileDiff {
             | FileDiff::Renamed(_, p) => p,
         }
     }
+
+    pub fn kind(&self) -> FileDiffKind {
+        match self {
+            FileDiff::Modified(_) => FileDiffKind::Modified,
+            FileDiff::Added(_) => FileDiffKind::Added,
+            FileDiff::Deleted(_) => FileDiffKind::Deleted,
+            FileDiff::Renamed(_, _) => FileDiffKind::Renamed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileDiffKind {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
 }

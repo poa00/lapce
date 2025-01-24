@@ -13,7 +13,6 @@ pub const SCOPES: &[&str] = &[
     "function",
     "label",
     "keyword",
-    "keyword.control",
     "string",
     "variable",
     "variable.other.member",
@@ -34,6 +33,14 @@ pub const SCOPES: &[&str] = &[
     "conceal",
     "none",
     "tag",
+    "markup.bold",
+    "markup.italic",
+    "markup.list",
+    "markup.quote",
+    "markup.heading",
+    "markup.link.url",
+    "markup.link.label",
+    "markup.link.text",
 ];
 
 pub fn line_styles(
@@ -57,11 +64,7 @@ pub fn line_styles(
             if start > end_offset || end < start_offset {
                 None
             } else {
-                let start = if start > start_offset {
-                    start - start_offset
-                } else {
-                    0
-                };
+                let start = start.saturating_sub(start_offset);
                 let end = end - start_offset;
                 let style = style.clone();
                 Some(LineStyle { start, end, style })

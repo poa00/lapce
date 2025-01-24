@@ -9,10 +9,13 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use crossbeam_channel::Sender;
 use jsonrpc_lite::{Id, Params};
 use lapce_core::meta;
-use lapce_rpc::{style::LineStyle, RpcError};
+use lapce_rpc::{
+    plugin::{PluginId, VoltID},
+    style::LineStyle,
+    RpcError,
+};
 use lapce_xi_rope::Rope;
 use lsp_types::{
     notification::{Initialized, Notification},
@@ -20,11 +23,14 @@ use lsp_types::{
     *,
 };
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use super::psp::{
-    handle_plugin_server_message, PluginHandlerNotification, PluginHostHandler,
-    PluginServerHandler, PluginServerRpcHandler, RpcCallback,
+use super::{
+    client_capabilities,
+    psp::{
+        handle_plugin_server_message, PluginHandlerNotification, PluginHostHandler,
+        PluginServerHandler, PluginServerRpcHandler, ResponseSender, RpcCallback,
+    },
 };
 use crate::{buffer::Buffer, plugin::PluginCatalogRpcHandler};
 
@@ -61,7 +67,7 @@ pub struct LspClient {
 }
 
 impl PluginServerHandler for LspClient {
-    fn method_registered(&mut self, method: &'static str) -> bool {
+    fn method_registered(&mut self, method: &str) -> bool {
         self.host.method_registered(method)
     }
 
@@ -82,9 +88,13 @@ impl PluginServerHandler for LspClient {
             Initialize => {
                 self.initialize();
             }
+            InitializeResult(result) => {
+                self.host.server_capabilities = result.capabilities;
+            }
             Shutdown => {
                 self.shutdown();
             }
+            SpawnedPluginLoaded { .. } => {}
         }
     }
 
@@ -93,13 +103,20 @@ impl PluginServerHandler for LspClient {
         id: Id,
         method: String,
         params: Params,
-        chan: Sender<Result<Value, RpcError>>,
+        resp: ResponseSender,
     ) {
-        self.host.handle_request(id, method, params, chan);
+        self.host.handle_request(id, method, params, resp);
     }
 
-    fn handle_host_notification(&mut self, method: String, params: Params) {
-        let _ = self.host.handle_notification(method, params);
+    fn handle_host_notification(
+        &mut self,
+        method: String,
+        params: Params,
+        from: String,
+    ) {
+        if let Err(err) = self.host.handle_notification(method, params, from) {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn handle_did_save_text_document(
@@ -157,8 +174,10 @@ impl LspClient {
         plugin_rpc: PluginCatalogRpcHandler,
         document_selector: DocumentSelector,
         workspace: Option<PathBuf>,
-        volt_id: String,
+        volt_id: VoltID,
         volt_display_name: String,
+        spawned_by: Option<PluginId>,
+        plugin_id: Option<PluginId>,
         pwd: Option<PathBuf>,
         server_uri: Url,
         args: Vec<String>,
@@ -168,10 +187,13 @@ impl LspClient {
             "file" => {
                 let path = server_uri.to_file_path().map_err(|_| anyhow!(""))?;
                 #[cfg(unix)]
-                let _ = std::process::Command::new("chmod")
+                if let Err(err) = std::process::Command::new("chmod")
                     .arg("+x")
                     .arg(&path)
-                    .output();
+                    .output()
+                {
+                    tracing::error!("{:?}", err);
+                }
                 path.to_str().ok_or_else(|| anyhow!(""))?.to_string()
             }
             "urn" => server_uri.path().to_string(),
@@ -185,36 +207,65 @@ impl LspClient {
 
         let mut writer = Box::new(BufWriter::new(stdin));
         let (io_tx, io_rx) = crossbeam_channel::unbounded();
-        let server_rpc = PluginServerRpcHandler::new(volt_id.clone(), io_tx.clone());
+        let server_rpc = PluginServerRpcHandler::new(
+            volt_id.clone(),
+            spawned_by,
+            plugin_id,
+            io_tx.clone(),
+        );
         thread::spawn(move || {
             for msg in io_rx {
+                if msg
+                    .get_method()
+                    .map(|x| x == lsp_types::request::Shutdown::METHOD)
+                    .unwrap_or_default()
+                {
+                    break;
+                }
                 if let Ok(msg) = serde_json::to_string(&msg) {
+                    tracing::debug!("write to lsp: {}", msg);
                     let msg =
                         format!("Content-Length: {}\r\n\r\n{}", msg.len(), msg);
-                    let _ = writer.write(msg.as_bytes());
-                    let _ = writer.flush();
+                    if let Err(err) = writer.write(msg.as_bytes()) {
+                        tracing::error!("{:?}", err);
+                    }
+                    if let Err(err) = writer.flush() {
+                        tracing::error!("{:?}", err);
+                    }
                 }
             }
         });
 
         let local_server_rpc = server_rpc.clone();
         let core_rpc = plugin_rpc.core_rpc.clone();
+        let volt_id_closure = volt_id.clone();
+        let name = volt_display_name.clone();
         thread::spawn(move || {
             let mut reader = Box::new(BufReader::new(stdout));
             loop {
                 match read_message(&mut reader) {
                     Ok(message_str) => {
+                        if !message_str.contains("$/progress") {
+                            tracing::debug!("read from lsp: {}", message_str);
+                        }
                         if let Some(resp) = handle_plugin_server_message(
                             &local_server_rpc,
                             &message_str,
+                            &name,
                         ) {
-                            let _ = io_tx.send(resp);
+                            if let Err(err) = io_tx.send(resp) {
+                                tracing::error!("{:?}", err);
+                            }
                         }
                     }
                     Err(_err) => {
                         core_rpc.log(
-                            log::Level::Error,
+                            lapce_rpc::core::LogLevel::Error,
                             format!("lsp server {server} stopped!"),
+                            Some(format!(
+                                "lapce_proxy::plugin::lsp::{}::{}::stopped",
+                                volt_id_closure.author, volt_id_closure.name
+                            )),
                         );
                         return;
                     }
@@ -223,6 +274,7 @@ impl LspClient {
         });
 
         let core_rpc = plugin_rpc.core_rpc.clone();
+        let volt_id_closure = volt_id.clone();
         thread::spawn(move || {
             let mut reader = Box::new(BufReader::new(stderr));
             loop {
@@ -233,8 +285,12 @@ impl LspClient {
                             return;
                         }
                         core_rpc.log(
-                            log::Level::Error,
-                            format!("lsp server stderr: {}", line.trim_end()),
+                            lapce_rpc::core::LogLevel::Trace,
+                            line.trim_end().to_string(),
+                            Some(format!(
+                                "lapce_proxy::plugin::lsp::{}::{}::stderr",
+                                volt_id_closure.author, volt_id_closure.name
+                            )),
                         );
                     }
                     Err(_) => {
@@ -250,6 +306,7 @@ impl LspClient {
             volt_id,
             volt_display_name,
             document_selector,
+            plugin_rpc.core_rpc.clone(),
             server_rpc.clone(),
             plugin_rpc.clone(),
         );
@@ -269,29 +326,35 @@ impl LspClient {
         plugin_rpc: PluginCatalogRpcHandler,
         document_selector: DocumentSelector,
         workspace: Option<PathBuf>,
-        volt_id: String,
+        volt_id: VoltID,
         volt_display_name: String,
+        spawned_by: Option<PluginId>,
+        plugin_id: Option<PluginId>,
         pwd: Option<PathBuf>,
         server_uri: Url,
         args: Vec<String>,
         options: Option<Value>,
-    ) -> Result<()> {
+    ) -> Result<PluginId> {
         let mut lsp = Self::new(
             plugin_rpc,
             document_selector,
             workspace,
             volt_id,
             volt_display_name,
+            spawned_by,
+            plugin_id,
             pwd,
             server_uri,
             args,
             options,
         )?;
+        let plugin_id = lsp.server_rpc.plugin_id;
+
         let rpc = lsp.server_rpc.clone();
         thread::spawn(move || {
             rpc.mainloop(&mut lsp);
         });
-        Ok(())
+        Ok(plugin_id)
     }
 
     fn initialize(&mut self) {
@@ -299,120 +362,13 @@ impl LspClient {
             .workspace
             .clone()
             .map(|p| Url::from_directory_path(p).unwrap());
-        let client_capabilities = ClientCapabilities {
-            text_document: Some(TextDocumentClientCapabilities {
-                synchronization: Some(TextDocumentSyncClientCapabilities {
-                    did_save: Some(true),
-                    dynamic_registration: Some(true),
-                    ..Default::default()
-                }),
-                completion: Some(CompletionClientCapabilities {
-                    completion_item: Some(CompletionItemCapability {
-                        snippet_support: Some(true),
-                        resolve_support: Some(
-                            CompletionItemCapabilityResolveSupport {
-                                properties: vec!["additionalTextEdits".to_string()],
-                            },
-                        ),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                signature_help: Some(SignatureHelpClientCapabilities {
-                    signature_information: Some(SignatureInformationSettings {
-                        documentation_format: Some(vec![
-                            MarkupKind::Markdown,
-                            MarkupKind::PlainText,
-                        ]),
-                        parameter_information: Some(ParameterInformationSettings {
-                            label_offset_support: Some(true),
-                        }),
-                        active_parameter_support: Some(true),
-                    }),
-                    ..Default::default()
-                }),
-                hover: Some(HoverClientCapabilities {
-                    content_format: Some(vec![
-                        MarkupKind::Markdown,
-                        MarkupKind::PlainText,
-                    ]),
-                    ..Default::default()
-                }),
-                inlay_hint: Some(InlayHintClientCapabilities {
-                    ..Default::default()
-                }),
-                code_action: Some(CodeActionClientCapabilities {
-                    data_support: Some(true),
-                    resolve_support: Some(CodeActionCapabilityResolveSupport {
-                        properties: vec!["edit".to_string()],
-                    }),
-                    code_action_literal_support: Some(CodeActionLiteralSupport {
-                        code_action_kind: CodeActionKindLiteralSupport {
-                            value_set: vec![
-                                CodeActionKind::EMPTY.as_str().to_string(),
-                                CodeActionKind::QUICKFIX.as_str().to_string(),
-                                CodeActionKind::REFACTOR.as_str().to_string(),
-                                CodeActionKind::REFACTOR_EXTRACT
-                                    .as_str()
-                                    .to_string(),
-                                CodeActionKind::REFACTOR_INLINE.as_str().to_string(),
-                                CodeActionKind::REFACTOR_REWRITE
-                                    .as_str()
-                                    .to_string(),
-                                CodeActionKind::SOURCE.as_str().to_string(),
-                                CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                                    .as_str()
-                                    .to_string(),
-                                "quickassist".to_string(),
-                                "source.fixAll".to_string(),
-                            ],
-                        },
-                    }),
-                    ..Default::default()
-                }),
-                semantic_tokens: Some(SemanticTokensClientCapabilities {
-                    ..Default::default()
-                }),
-                type_definition: Some(GotoCapability {
-                    // Note: This is explicitly specified rather than left to the Default because
-                    // of a bug in lsp-types https://github.com/gluon-lang/lsp-types/pull/244
-                    link_support: Some(false),
-                    ..Default::default()
-                }),
-                definition: Some(GotoCapability {
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            window: Some(WindowClientCapabilities {
-                work_done_progress: Some(true),
-                show_message: Some(ShowMessageRequestClientCapabilities {
-                    message_action_item: Some(MessageActionItemCapabilities {
-                        additional_properties_support: Some(true),
-                    }),
-                }),
-                ..Default::default()
-            }),
-            workspace: Some(WorkspaceClientCapabilities {
-                symbol: Some(WorkspaceSymbolClientCapabilities {
-                    ..Default::default()
-                }),
-                configuration: Some(false),
-                ..Default::default()
-            }),
-
-            experimental: Some(json!({
-                "serverStatusNotification": true,
-            })),
-            ..Default::default()
-        };
-
+        tracing::debug!("initialization_options {:?}", self.options);
         #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(process::id()),
             root_uri: root_uri.clone(),
             initialization_options: self.options.clone(),
-            capabilities: client_capabilities,
+            capabilities: client_capabilities(),
             trace: Some(TraceValue::Verbose),
             workspace_folders: root_uri.map(|uri| {
                 vec![WorkspaceFolder {
@@ -426,30 +382,37 @@ impl LspClient {
             }),
             locale: None,
             root_path: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
         };
-        if let Ok(value) = self.server_rpc.server_request(
+        match self.server_rpc.server_request(
             Initialize::METHOD,
             params,
             None,
             None,
             false,
         ) {
-            let result: InitializeResult = serde_json::from_value(value).unwrap();
-            self.host.server_capabilities = result.capabilities;
-            self.server_rpc.server_notification(
-                Initialized::METHOD,
-                InitializedParams {},
-                None,
-                None,
-                false,
-            );
-            if self
-                .plugin_rpc
-                .plugin_server_loaded(self.server_rpc.clone())
-                .is_err()
-            {
-                self.server_rpc.shutdown();
-                self.shutdown();
+            Ok(value) => {
+                let result: InitializeResult =
+                    serde_json::from_value(value).unwrap();
+                self.host.server_capabilities = result.capabilities;
+                self.server_rpc.server_notification(
+                    Initialized::METHOD,
+                    InitializedParams {},
+                    None,
+                    None,
+                    false,
+                );
+                if self
+                    .plugin_rpc
+                    .plugin_server_loaded(self.server_rpc.clone())
+                    .is_err()
+                {
+                    self.server_rpc.shutdown();
+                    self.shutdown();
+                }
+            }
+            Err(err) => {
+                tracing::error!("{:?}", err);
             }
         }
         //     move |result| {
@@ -465,8 +428,12 @@ impl LspClient {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        if let Err(err) = self.process.kill() {
+            tracing::error!("{:?}", err);
+        }
+        if let Err(err) = self.process.wait() {
+            tracing::error!("{:?}", err);
+        }
     }
 
     fn process(
@@ -544,7 +511,7 @@ pub fn read_message<T: BufRead>(reader: &mut T) -> Result<String> {
 
     loop {
         buffer.clear();
-        let _result = reader.read_line(&mut buffer);
+        let _ = reader.read_line(&mut buffer)?;
         // eprin
         match &buffer {
             s if s.trim().is_empty() => break,

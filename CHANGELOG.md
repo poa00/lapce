@@ -2,18 +2,157 @@
 
 ## Unreleased
 
+### Features/Changes
+
+- Add Ubuntu 24.04 LTS (noble) build
+
+### Bug Fixes
+
+## 0.4.2
+
+### Features/Changes
+- Implement "Run in terminal"
+- Implement document symbols in a panel
+- Implement "Go To Location" functionality in the Diff editor.
+- Implement on screen find which is similar to `f` in vim but for the whole screen.
+- Make file explorer horizontal scrollable
+- Implement "Reveal in system file explorer"
+
+### Bug Fixes
+- Fix markdown syntax highlighting
+- Fix click issue on window error message
+
+## 0.4.1
+
+### Features/Changes
+- Add fedora builds
+- Finish tree sitter dynamic libary support by downloading from https://github.com/lapce/tree-sitter-grammars
+- Saves scale configuration in settings to restore at startup
+- text in ui can be selected and copied
+- add right click context menu for editor tab
+- terminal: added support for Alt+ some character input
+- Terminal: right-click to add "clear all" function
+- terminal: double-click to maximize bottom
+- initial lsp code lens support for rust-analyzer
+- Context menu for "reveal file in explorer"
+- support rust-analyzer's notification "experimental/serverStatus"
+- jump to definition support in Inlay Hints
+- "Show Call Hierarchy" support
+- Add proxy support and retry to all HTTPS GET requests.
+- Implement the drag-and-drop to open file/folder
+
+### Bug Fixes
+- [#3203](https://github.com/lapce/lapce/pull/3203): Fallback to default theme is theme key is not found
+- use windows subsystem to prevent console running
+- reimplement gotodefinition on cmd/ctrl+click
+- fix crash on tinyskia renderer
+- show file status for scratch documents
+- fix crash due to locale_config
+
+## 0.4.0
+
+### Features/Changes
+- [#2723](https://github.com/lapce/lapce/pull/2723): Line wrapping based on width (no column-based yet)
+- [#1277](https://github.com/lapce/lapce/pull/1277): Error message prompted on missing git user.email and/or user.name
+- [#2910](https://github.com/lapce/lapce/pull/2910): Files can be compared in the diff editor
+- [#2918](https://github.com/lapce/lapce/pull/2918): Allow searching the shortcuts overview by shortcut (e.g. "Ctrl+P") or when condition (e.g. "list_focus")
+- [#2955](https://github.com/lapce/lapce/pull/2955): Using glob patterns to hide files or directories in explorer
+- [#3026](https://github.com/lapce/lapce/pull/3026): Add missing file explorer context menu entries
+- [#3047](https://github.com/lapce/lapce/pull/3047): Add support for different CrLf/Lf line endings per-file
+- [#3053](https://github.com/lapce/lapce/pull/3053): Add tooltips to various places
+- [#3069](https://github.com/lapce/lapce/pull/3069): Allow color variables for themes
+- [#3086](https://github.com/lapce/lapce/pull/3086): Add folding to panels
+- [#3095](https://github.com/lapce/lapce/pull/3095): Add option to hide the Open Editors section in the explorer
+- [#3096](https://github.com/lapce/lapce/pull/3096): Add source control status coloring to file explorer
+- [#2989](https://github.com/lapce/lapce/pull/2989): Add building packages for linux distros
+- [#3123](https://github.com/lapce/lapce/pull/3123): Swap sled to plain text file for db
+
+### Bug Fixes
+- [#2779](https://github.com/lapce/lapce/pull/2779): Fix files detection on fresh git/VCS repository
+- [#3031](https://github.com/lapce/lapce/pull/3031): Fix find not receiving inputs when clicked
+- [#3142](https://github.com/lapce/lapce/pull/3142): Fix terminal default profile saving incorrectly
+- [#3158](https://github.com/lapce/lapce/pull/3158): Fix ShowHover command for showing hover with keybind
+- [#3119](https://github.com/lapce/lapce/pull/3119): Fix non US keyboard layout
+
+## 0.3.1
+
+### Features/Changes
+
+### Bug Fixes
+- [#2754](https://github.com/lapce/lapce/pull/2754): Don't mark nonexistent files as read only (fix saving new files)
+- [#2819](https://github.com/lapce/lapce/issues/2819): `Save Without Formatting` doesn't save the file
+
+## 0.3.0
+
+### Features/Changes
+- [#2190](https://github.com/lapce/lapce/pull/2190): Rewrite with Floem UI
+- [#2425](https://github.com/lapce/lapce/pull/2425): Reimplement completion lens
+- [#2498](https://github.com/lapce/lapce/pull/2498): Show Lapce as an option when doing "Open With..." on Linux
+- [#2549](https://github.com/lapce/lapce/pull/2549): Implement multi-line vim-motion yank and delete (`3dd`, `2yy`, etc.)
+- [#2553](https://github.com/lapce/lapce/pull/2553): Implement search and replace
+- [#1809](https://github.com/lapce/lapce/pull/1809): Implement debug adapter protocol
+
+### Bug Fixes
+
+- [#2650](https://github.com/lapce/lapce/pull/2650): Inform language servers that Lapce supports LSP diagnostics
+
+## 0.2.8
+
+### Features/Changes
+
+- [#1964](https://github.com/lapce/lapce/pull/1964): Add option to open files at line/column
+- [#2403](https://github.com/lapce/lapce/pull/2403): Add basic Vim marks feature
+
+### Bug Fixes
+
+## 0.2.7
+
+### Features/Changes
+
+### Bug Fixes
+- [#2209](https://github.com/lapce/lapce/pull/2209): Fix macOS crashes
+- [#2228](https://github.com/lapce/lapce/pull/2228): Fix `.desktop` entry to properly associate with Lapce on Wayland
+
+## 0.2.6
+
 ### Breaking changes
 
 - [#1820](https://github.com/lapce/lapce/pull/1820): Add remote svg icon colour to theme, disable plugin settings when none are available
+- [#1988](https://github.com/lapce/lapce/pull/1987): Replace modal status background with background/foreground theme keys
 
 ### Features/Changes
+- [#1899](https://github.com/lapce/lapce/pull/1899): Improve sorting files with numbers
 - [#1831](https://github.com/lapce/lapce/pull/1831): Plugin settings shown on right click
-
 - [#1830](https://github.com/lapce/lapce/pull/1830): Adds Clojure language support
-
 - [#1835](https://github.com/lapce/lapce/pull/1835): Add mouse keybinds
+- [#1856](https://github.com/lapce/lapce/pull/1856): Highlight git/VCS modified files in explorer, palette, and buffer tabs
+- [#1574](https://github.com/lapce/lapce/pull/1574): Panel sections can be expanded/collapsed
+- [#1938](https://github.com/lapce/lapce/pull/1938): Use dropdown for theme selection in settings
+- [#1960](https://github.com/lapce/lapce/pull/1960): Add sticky headers and code lens for PHP
+- [#1968](https://github.com/lapce/lapce/pull/1968): Completion lens (disabled by default)
+  - ![image](https://user-images.githubusercontent.com/13157904/211959283-c3229cfc-28d7-4676-a50d-aec7d47cde9f.png)
+- [#1972](https://github.com/lapce/lapce/pull/1972): Add file duplication option in fs tree context menu
+- [#1991](https://github.com/lapce/lapce/pull/1991): Implement rendering of images in markdown views
+- [#2004](https://github.com/lapce/lapce/pull/2004): Add ToggleHistory command
+- [#2033](https://github.com/lapce/lapce/pull/2033): Add setting for double click delay (Currently only works for opening file from the explorer)
+- [#2045](https://github.com/lapce/lapce/pull/2045): Add 'Rename Symbol' option on right-click
+- [#2071](https://github.com/lapce/lapce/pull/2071): Add command and keybinds to delete line
+- [#2073](https://github.com/lapce/lapce/pull/2073): Add Ctrl+{a,e,k} keybinds on macOS
+- [#2128](https://github.com/lapce/lapce/pull/2128): Add Lapce app icon to logo collection
+- [#2127](https://github.com/lapce/lapce/pull/2127): Extended double-click options with file-only and file + folders mode
+- [#1944](https://github.com/lapce/lapce/pull/1944): Add filter input in git branch selection
+  - ![image](https://user-images.githubusercontent.com/4404609/211232461-293e3b31-4e17-457e-825c-3018699a6fc2.png)
 
 ### Bug Fixes
+- [#1911](https://github.com/lapce/lapce/pull/1911): Fix movement on selections with left/right arrow keys
+- [#1939](https://github.com/lapce/lapce/pull/1939): Fix saving/editing newly saved-as files
+- [#1971](https://github.com/lapce/lapce/pull/1971): Fix up/down movement on first/last line
+- [#2036](https://github.com/lapce/lapce/pull/2036): Fix movement on selections with up/down arrow keys
+- [#2056](https://github.com/lapce/lapce/pull/2056): Fix default directory of remote session file picker
+- [#2072](https://github.com/lapce/lapce/pull/2072): Fix connection issues from Windows to lapce proxy
+- [#2069](https://github.com/lapce/lapce/pull/2045): Fix not finding git repositories in parent path
+- [#2131](https://github.com/lapce/lapce/pull/2131): Fix overwriting symlink
+- [#2188](https://github.com/lapce/lapce/pull/2188): Fix auto closing matching pairs in inappropriate inputs
 
 ## 0.2.5
 

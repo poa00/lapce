@@ -221,6 +221,9 @@
                 "auto-closing-matching-pairs": {
                     "type": "boolean"
                 },
+                "auto-surround": {
+                    "type": "boolean"
+                },
                 "hover-delay": {
                     "type": "integer"
                 },
@@ -231,6 +234,9 @@
                     "type": "boolean"
                 },
                 "highlight-matching-brackets": {
+                    "type": "boolean"
+                },
+                "highlight-selection-occurrences": {
                     "type": "boolean"
                 },
                 "autosave-interval": {
@@ -327,7 +333,7 @@
                 "drop-shadow-width": {
                     "type": "integer"
                 },
-                "preview-editor-width": {
+                "palette-width": {
                     "type": "integer"
                 },
                 "hover-font-family": {

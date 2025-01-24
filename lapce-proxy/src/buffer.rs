@@ -9,9 +9,8 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use lapce_core::{
-    buffer::rope_text::CharIndicesJoin, encoding::offset_utf8_to_utf16,
-};
+use floem_editor_core::buffer::rope_text::CharIndicesJoin;
+use lapce_core::encoding::offset_utf8_to_utf16;
 use lapce_rpc::buffer::BufferId;
 use lapce_xi_rope::{interval::IntervalBounds, rope::Rope, RopeDelta};
 use lsp_types::*;
@@ -19,6 +18,7 @@ use lsp_types::*;
 #[derive(Clone)]
 pub struct Buffer {
     pub language_id: &'static str,
+    pub read_only: bool,
     pub id: BufferId,
     pub rope: Rope,
     pub path: PathBuf,
@@ -28,13 +28,27 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(id: BufferId, path: PathBuf) -> Buffer {
-        let rope = Rope::from(load_file(&path).unwrap_or_default());
+        let (s, read_only) = match load_file(&path) {
+            Ok(s) => (s, false),
+            Err(err) => match err.downcast_ref::<std::io::Error>() {
+                Some(err) => match err.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        ("Permission Denied".to_string(), true)
+                    }
+                    std::io::ErrorKind::NotFound => ("".to_string(), false),
+                    _ => ("Not Supported".to_string(), true),
+                },
+                None => ("Not Supported".to_string(), true),
+            },
+        };
+        let rope = Rope::from(s);
         let rev = u64::from(!rope.is_empty());
         let language_id = language_id_from_path(&path).unwrap_or("");
         let mod_time = get_mod_time(&path);
         Buffer {
             id,
             rope,
+            read_only,
             path,
             language_id,
             rev,
@@ -42,32 +56,54 @@ impl Buffer {
         }
     }
 
-    pub fn save(&mut self, rev: u64) -> Result<()> {
+    pub fn save(&mut self, rev: u64, create_parents: bool) -> Result<()> {
+        if self.read_only {
+            return Err(anyhow!("can't save to read only file"));
+        }
+
         if self.rev != rev {
             return Err(anyhow!("not the right rev"));
         }
-        let tmp_extension = self.path.extension().map_or_else(
-            || OsString::from("swp"),
+        let bak_extension = self.path.extension().map_or_else(
+            || OsString::from("bak"),
             |ext| {
                 let mut ext = ext.to_os_string();
-                ext.push(".swp");
+                ext.push(".bak");
                 ext
             },
         );
-        let tmp_path = &self.path.with_extension(tmp_extension);
+        let path = if self.path.is_symlink() {
+            self.path.canonicalize()?
+        } else {
+            self.path.clone()
+        };
+        let new_file = !path.exists();
 
-        let mut f = File::create(tmp_path)?;
+        let bak_file_path = &path.with_extension(bak_extension);
+        if !new_file {
+            fs::copy(&path, bak_file_path)?;
+        }
+
+        if create_parents {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
         for chunk in self.rope.iter_chunks(..self.rope.len()) {
             f.write_all(chunk.as_bytes())?;
         }
 
-        if let Ok(metadata) = fs::metadata(&self.path) {
-            let perm = metadata.permissions();
-            fs::set_permissions(tmp_path, perm)?;
+        self.mod_time = get_mod_time(&path);
+        if !new_file {
+            fs::remove_file(bak_file_path)?;
         }
 
-        fs::rename(tmp_path, &self.path)?;
-        self.mod_time = get_mod_time(&self.path);
         Ok(())
     }
 
@@ -95,8 +131,8 @@ impl Buffer {
         self.rope.to_string()
     }
 
-    pub fn offset_of_line(&self, offset: usize) -> usize {
-        self.rope.offset_of_line(offset)
+    pub fn offset_of_line(&self, line: usize) -> usize {
+        self.rope.offset_of_line(line)
     }
 
     pub fn line_of_offset(&self, offset: usize) -> usize {
@@ -127,6 +163,11 @@ impl Buffer {
         self.rope.slice_to_cow(range)
     }
 
+    pub fn line_to_cow(&self, line: usize) -> Cow<str> {
+        self.rope
+            .slice_to_cow(self.offset_of_line(line)..self.offset_of_line(line + 1))
+    }
+
     /// Iterate over (utf8_offset, char) values in the given range  
     /// This uses `iter_chunks` and so does not allocate, compared to `slice_to_cow` which can
     pub fn char_indices_iter<T: IntervalBounds>(
@@ -146,12 +187,10 @@ impl Buffer {
 }
 
 pub fn load_file(path: &Path) -> Result<String> {
-    Ok(read_path_to_string_lossy(path)?)
+    read_path_to_string(path)
 }
 
-pub fn read_path_to_string_lossy<P: AsRef<Path>>(
-    path: P,
-) -> Result<String, std::io::Error> {
+pub fn read_path_to_string<P: AsRef<Path>>(path: P) -> Result<String> {
     let path = path.as_ref();
 
     let mut file = File::open(path)?;
@@ -159,9 +198,8 @@ pub fn read_path_to_string_lossy<P: AsRef<Path>>(
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
 
-    // Parse the file contents as utf8, replacing non-utf8 data with the
-    // replacement character
-    let contents = String::from_utf8_lossy(&buffer);
+    // Parse the file contents as utf8
+    let contents = String::from_utf8(buffer)?;
 
     Ok(contents.to_string())
 }
@@ -228,12 +266,13 @@ pub fn language_id_from_path(path: &Path) -> Option<&'static str> {
                     "sql" => "sql",
                     "swift" => "swift",
                     "svelte" => "svelte",
+                    "thrift" => "thrift",
                     "toml" => "toml",
                     "ts" => "typescript",
                     "tsx" => "typescriptreact",
                     "tex" => "tex",
                     "vb" => "vb",
-                    "xml" => "xml",
+                    "xml" | "csproj" => "xml",
                     "xsl" => "xsl",
                     "yml" | "yaml" => "yaml",
                     "zig" => "zig",

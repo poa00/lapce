@@ -32,7 +32,7 @@ mode = "i"
 
 [[keymaps]]
 key = "shift+backspace"
-command = "delete_backward"
+command = "delete_forward"
 mode = "i"
 
 [[keymaps]]
@@ -109,7 +109,7 @@ command = "jump_location_backward"
 mode = "i"
 
 [[keymaps]]
-key = "ctrl+_"
+key = "ctrl+shift+-"
 command = "jump_location_forward"
 mode = "i"
 
@@ -205,16 +205,36 @@ mode = "n"
 [[keymaps]]
 key = "esc"
 command = "modal.close"
-when = "modal_focus"
+when = "modal_focus || completion_focus"
 
 [[keymaps]]
-key = "ctrl+b"
-command = "left"
+key = "tab"
+command = "inline_completion.select"
+when = "inline_completion_visible && !search_focus && !modal_focus && !list_focus && !search_active"
 mode = "i"
 
 [[keymaps]]
-key = "ctrl+f"
-command = "right"
+key = "esc"
+command = "inline_completion.cancel"
+when = "inline_completion_visible && !search_focus && !modal_focus && !list_focus && !search_active"
+mode = "i"
+
+[[keymaps]]
+key = "alt+["
+command = "inline_completion.previous"
+when = "inline_completion_visible && !search_focus && !modal_focus && !list_focus && !search_active"
+mode = "i"
+
+[[keymaps]]
+key = "alt+]"
+command = "inline_completion.next"
+when = "inline_completion_visible && !search_focus && !modal_focus && !list_focus && !search_active"
+mode = "i"
+
+[[keymaps]]
+key = "alt+\\"
+command = "inline_completion.invoke"
+when = "!inline_completion_visible && !search_focus && !modal_focus && !list_focus && !search_active"
 mode = "i"
 
 [[keymaps]]
@@ -251,6 +271,16 @@ when = "!list_focus && !input_focus"
 mode = "i"
 
 [[keymaps]]
+key = "tab"
+command = "focus_replace_editor"
+when = "search_focus"
+
+[[keymaps]]
+key = "tab"
+command = "focus_find_editor"
+when = "replace_focus"
+
+[[keymaps]]
 key = "shift+enter"
 command = "search_backward"
 when = "search_focus"
@@ -277,7 +307,7 @@ mode = "i"
 [[keymaps]]
 key = "tab"
 command = "insert_tab"
-when = "!in_snippet && !completion_focus"
+when = "!in_snippet && !completion_focus && !inline_completion_visible && !search_focus && !replace_focus"
 mode = "i"
 
 [[keymaps]]
@@ -302,7 +332,7 @@ mode = "i"
 key = "esc"
 command = "normal_mode"
 mode = "niv"
-when = "!search_focus && !modal_focus && !search_active"
+when = "!search_focus && !modal_focus && !search_active && !inline_completion_visible"
 
 [[keymaps]]
 key = "ctrl+c"
@@ -317,7 +347,7 @@ mode = "niv"
 when = "!search_focus && !search_active"
 
 [[keymaps]]
-key = ":"
+key = "shift+;"
 command = "palette.command"
 mode = "n"
 
@@ -378,12 +408,12 @@ mode = "n"
 
 [[keymaps]]
 key = "ctrl+i"
-command = "jump_location_forward"
+command = "jump_location_forward_local"
 mode = "n"
 
 [[keymaps]]
 key = "ctrl+o"
-command = "jump_location_backward"
+command = "jump_location_backward_local"
 mode = "n"
 
 [[keymaps]]
@@ -477,12 +507,12 @@ command = "line_start"
 mode = "nv"
 
 [[keymaps]]
-key = "^"
+key = "shift+6"
 command = "line_start_non_blank"
 mode = "nv"
 
 [[keymaps]]
-key = "$"
+key = "shift+4"
 command = "line_end"
 mode = "nv"
 
@@ -547,6 +577,16 @@ command = "delete_forward"
 mode = "v"
 
 [[keymaps]]
+key = "m"
+command = "create_mark"
+mode = "nv"
+
+[[keymaps]]
+key = "'"
+command = "go_to_mark"
+mode = "nv"
+
+[[keymaps]]
 key = "f"
 command = "inline_find_right"
 mode = "nv"
@@ -567,12 +607,12 @@ command = "motion_mode_delete"
 mode = "n"
 
 [[keymaps]]
-key = ">"
+key = "shift+."
 command = "motion_mode_indent"
 mode = "n"
 
 [[keymaps]]
-key = "<"
+key = "shift+,"
 command = "motion_mode_outdent"
 mode = "n"
 
@@ -582,7 +622,7 @@ command = "motion_mode_yank"
 mode = "n"
 
 [[keymaps]]
-key = "*"
+key = "shift+8"
 command = "search_whole_word_forward"
 mode = "nv"
 
@@ -597,27 +637,27 @@ command = "search_backward"
 mode = "nv"
 
 [[keymaps]]
-key = "%"
+key = "shift+5"
 command = "match_pairs"
 mode = "nv"
 
 [[keymaps]]
-key = "] )"
+key = "] shift+0"
 command = "next_unmatched_right_bracket"
 mode = "nv"
 
 [[keymaps]]
-key = "[ ("
+key = "[ shift+9"
 command = "previous_unmatched_left_bracket"
 mode = "nv"
 
 [[keymaps]]
-key = "] }"
+key = "] shift+]"
 command = "next_unmatched_right_curly_bracket"
 mode = "nv"
 
 [[keymaps]]
-key = "[ {"
+key = "[ shift+["
 command = "previous_unmatched_left_curly_bracket"
 mode = "nv"
 
@@ -678,16 +718,16 @@ mode = "n"
 
 [[keymaps]]
 key = "space"
-command = "toggle_code_lens"
+command = "toggle_code_glance"
 mode = "nv"
 
 [[keymaps]]
-key = ">"
+key = "shift+."
 command = "indent_line"
 mode = "v"
 
 [[keymaps]]
-key = "<"
+key = "shift+,"
 command = "outdent_line"
 mode = "v"
 
